@@ -48,7 +48,24 @@ Do not disable certificate validation in production.
 
 ## Run the report
 
-From the repository root:
+### Interactive setup
+
+The easiest option is the guided shell wrapper. It prompts for the connection,
+authentication, certificate validation, reporting period, and output files, so
+you do not need to export environment variables:
+
+```bash
+./run-report.sh
+```
+
+Password and token input is hidden and is used only by the analyzer process;
+the wrapper does not write credentials to disk. It creates both the YAML and
+Markdown reports by default.
+
+### Environment-variable setup
+
+For automation or non-interactive use, configure the environment as described
+above and run from the repository root:
 
 ```bash
 python3 scripts/export_recent_team_resources.py \
