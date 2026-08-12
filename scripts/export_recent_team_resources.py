@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime as dt
+import html
 import json
 import os
 import ssl
@@ -227,6 +228,145 @@ def render_yaml(report: list[dict[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def markdown_text(value: Any) -> str:
+    """Escape API-provided text for safe use in Markdown tables and prose."""
+    return html.escape(str(value), quote=False).replace("|", "&#124;").replace("\n", " ")
+
+
+def markdown_link(relation: dict[str, Any]) -> str:
+    name = markdown_text(relation["name"])
+    url = str(relation["api_url"]).replace(" ", "%20").replace(")", "%29")
+    return f"[{name}]({url})"
+
+
+def render_markdown(report: list[dict[str, Any]], days: int, cutoff: str) -> str:
+    """Render a concise human-readable companion to the YAML report."""
+    organizations = {item["organization"] for item in report}
+    teams = {
+        (access["organization"], access["team"])
+        for item in report
+        for access in item["access"]
+    }
+    level_counts = {
+        level: sum(
+            access["level"] == level
+            for item in report
+            for access in item["access"]
+        )
+        for level in ("admin", "execute", "view")
+    }
+    without_access = sum(not item["access"] for item in report)
+
+    lines = [
+        "# AAP Job Template Access Report",
+        "",
+        (
+            f"> Current team access to Job Templates with a last run in the past "
+            f"{days} days (cutoff `{cutoff}`)."
+        ),
+        "",
+        "## Summary",
+        "",
+        "| Metric | Count |",
+        "| --- | ---: |",
+        f"| Recently used Job Templates | {len(report)} |",
+        f"| Owning organizations | {len(organizations)} |",
+        f"| Teams with access | {len(teams)} |",
+        f"| Templates with no team access | {without_access} |",
+        f"| Admin grants | {level_counts['admin']} |",
+        f"| Execute grants | {level_counts['execute']} |",
+        f"| View grants | {level_counts['view']} |",
+        "",
+        "## Templates",
+        "",
+    ]
+    if not report:
+        lines.extend(["No Job Templates matched the selected period.", ""])
+    else:
+        lines.extend(
+            [
+                "| Organization | Job Template | Last run | Project | Inventory | Teams |",
+                "| --- | --- | --- | --- | --- | ---: |",
+            ]
+        )
+        for resource in report:
+            project = resource.get("project")
+            inventory = resource.get("inventory")
+            lines.append(
+                "| {organization} | {template} | {last_run} | {project} | "
+                "{inventory} | {teams} |".format(
+                    organization=markdown_text(resource["organization"]),
+                    template=markdown_link(resource),
+                    last_run=markdown_text(resource.get("last_job_run", "Unknown")),
+                    project=markdown_link(project) if project else "—",
+                    inventory=markdown_link(inventory) if inventory else "—",
+                    teams=len(resource["access"]),
+                )
+            )
+        lines.append("")
+
+    lines.extend(["## Details", ""])
+    for resource in report:
+        detail_heading = (
+            f"### {markdown_text(resource['organization'])} — "
+            f"{markdown_text(resource['name'])}"
+        )
+        lines.extend(
+            [
+                detail_heading,
+                "",
+                f"- **Job Template:** {markdown_link(resource)}",
+                f"- **Last run:** `{markdown_text(resource.get('last_job_run', 'Unknown'))}`",
+            ]
+        )
+        if resource.get("playbook"):
+            lines.append(f"- **Playbook:** `{markdown_text(resource['playbook'])}`")
+        for label, field in (("Project", "project"), ("Inventory", "inventory")):
+            if resource.get(field):
+                lines.append(f"- **{label}:** {markdown_link(resource[field])}")
+        credentials = resource.get("credentials", [])
+        if credentials:
+            credential_links = []
+            for credential in credentials:
+                credential_type = credential.get("type")
+                suffix = f" (`{markdown_text(credential_type)}`)" if credential_type else ""
+                credential_links.append(f"{markdown_link(credential)}{suffix}")
+            lines.append(f"- **Credentials:** {', '.join(credential_links)}")
+        lines.append("")
+        if resource["access"]:
+            lines.extend(
+                [
+                    "| Team organization | Team | Access | Source |",
+                    "| --- | --- | --- | --- |",
+                ]
+            )
+            for access in resource["access"]:
+                sources = ", ".join(
+                    source.replace("organization_role", "organization role")
+                    for source in access["sources"]
+                )
+                lines.append(
+                    f"| {markdown_text(access['organization'])} | "
+                    f"{markdown_text(access['team'])} | {access['level']} | {sources} |"
+                )
+        else:
+            lines.append("**Attention:** No current team access was found.")
+        lines.append("")
+
+    lines.extend(
+        [
+            "---",
+            "",
+            (
+                "This is a snapshot of current team RBAC filtered by Job Template "
+                "`last_job_run`; it is not a historical reconstruction of revoked access."
+            ),
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def effective_access_level(permissions: set[str]) -> Optional[str]:
     if permissions & {
         "awx.add_jobtemplate",
@@ -397,6 +537,10 @@ def main() -> int:
     )
     parser.add_argument("--days", type=int, default=365)
     parser.add_argument("--output", default="-", help="YAML file path; default is stdout")
+    parser.add_argument(
+        "--markdown-output",
+        help="optional human-readable Markdown report path",
+    )
     args = parser.parse_args()
     if args.days < 1:
         parser.error("--days must be at least 1")
@@ -409,6 +553,10 @@ def main() -> int:
             with open(args.output, "w", encoding="utf-8") as target:
                 target.write(rendered)
             print(f"Wrote {args.output} (cutoff {cutoff})", file=sys.stderr)
+        if args.markdown_output:
+            with open(args.markdown_output, "w", encoding="utf-8") as target:
+                target.write(render_markdown(report, args.days, cutoff))
+            print(f"Wrote {args.markdown_output} (cutoff {cutoff})", file=sys.stderr)
     except (ExportError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

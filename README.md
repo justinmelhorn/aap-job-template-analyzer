@@ -52,16 +52,23 @@ From the repository root:
 ```bash
 python3 scripts/export_recent_team_resources.py \
   --days 365 \
-  --output team-resources.yaml
+  --output team-resources.yaml \
+  --markdown-output team-resources.md
 ```
 
-Omit `--output` to write YAML to standard output. `--days` must be at least 1
-and defaults to 365.
+The YAML is the machine-readable source. The optional Markdown companion adds
+a summary, a compact template table, clickable AAP resource links, and detailed
+team-access tables for easy review in GitHub or any Markdown viewer.
+
+Omit `--output` to write YAML to standard output. Omit `--markdown-output` if
+you only need YAML. `--days` must be at least 1 and defaults to 365.
 
 The command only sends HTTP `GET` requests. It does not launch jobs, modify
 RBAC, change templates, or clean up AAP data.
 
 ## Output
+
+### YAML
 
 ```yaml
 job_templates:
@@ -88,6 +95,31 @@ job_templates:
           - "direct"
 ```
 
+### Markdown summary
+
+```markdown
+# AAP Job Template Access Report
+
+## Summary
+
+| Metric | Count |
+| --- | ---: |
+| Recently used Job Templates | 1 |
+| Owning organizations | 1 |
+| Teams with access | 4 |
+| Templates with no team access | 0 |
+
+## Templates
+
+| Organization | Job Template | Last run | Project | Inventory | Teams |
+| --- | --- | --- | --- | --- | ---: |
+| Payments | Payments \| Deploy Development | 2026-08-12T15:20:12Z | Payments Automation | Payments Development | 4 |
+```
+
+The Markdown summary also counts effective admin, execute, and view grants.
+Each detailed section lists credentials and the access level/source for every
+team. Templates without team access are called out for attention.
+
 Access levels are reduced to `view`, `execute`, or `admin`. Sources are
 `direct`, `organization_role`, or both. A recently used template with no
 current team assignment is retained with `access: []`.
@@ -113,9 +145,9 @@ for later supported versions.
 
 ## Git and security
 
-`lab.env` and the default `team-resources.yaml` output are excluded by the
+`lab.env`, `team-resources.yaml`, and `team-resources.md` are excluded by the
 repository's `.gitignore`. Never commit AAP passwords or tokens. Although the
-report contains no credential secrets, it does contain organization, team,
+reports contain no credential secrets, they do contain organization, team,
 inventory, project, credential, and template names; review that operational
 metadata before publishing a generated report.
 

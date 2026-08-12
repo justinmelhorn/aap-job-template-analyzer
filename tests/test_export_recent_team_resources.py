@@ -241,6 +241,30 @@ class ExportTests(unittest.TestCase):
     def test_empty_report_yaml(self):
         self.assertEqual("job_templates: []\n", MODULE.render_yaml([]))
 
+    def test_markdown_has_summary_links_details_and_access(self):
+        report, _ = MODULE.build_report(FakeClient(), 365)
+        rendered = MODULE.render_markdown(report, 365, "2025-08-12T00:00:00Z")
+        self.assertIn("# AAP Job Template Access Report", rendered)
+        self.assertIn("| Recently used Job Templates | 3 |", rendered)
+        self.assertIn("| Owning organizations | 3 |", rendered)
+        self.assertIn("| Teams with access | 3 |", rendered)
+        self.assertIn("| Templates with no team access | 1 |", rendered)
+        self.assertIn("| Admin grants | 2 |", rendered)
+        self.assertIn(
+            "[Payments &#124; Health Check]"
+            "(https://aap.example.com/api/controller/v2/job_templates/10/)",
+            rendered,
+        )
+        self.assertIn("Payments Developers | admin | direct, organization role", rendered)
+        self.assertIn("**Attention:** No current team access was found.", rendered)
+        self.assertNotIn("must-not-be-exported", rendered)
+        self.assertNotIn("inputs", rendered)
+
+    def test_empty_markdown_report(self):
+        rendered = MODULE.render_markdown([], 30, "2026-07-13T00:00:00Z")
+        self.assertIn("| Recently used Job Templates | 0 |", rendered)
+        self.assertIn("No Job Templates matched the selected period.", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()
