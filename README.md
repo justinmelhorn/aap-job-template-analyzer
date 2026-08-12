@@ -57,8 +57,9 @@ python3 scripts/export_recent_team_resources.py \
 ```
 
 The YAML is the machine-readable source. The optional Markdown companion adds
-a summary, a compact template table, clickable AAP resource links, and detailed
-team-access tables for easy review in GitHub or any Markdown viewer.
+a summary, a compact template table, friendly `([view in AAP](...))` UI links,
+and detailed team-access tables for easy review in GitHub or any Markdown
+viewer. YAML continues to expose stable API URLs for automation.
 
 Omit `--output` to write YAML to standard output. Omit `--markdown-output` if
 you only need YAML. `--days` must be at least 1 and defaults to 365.
@@ -113,12 +114,16 @@ job_templates:
 
 | Organization | Job Template | Last run | Project | Inventory | Teams |
 | --- | --- | --- | --- | --- | ---: |
-| Payments | Payments \| Deploy Development | 2026-08-12T15:20:12Z | Payments Automation | Payments Development | 4 |
+| Payments | Payments \| Deploy Development ([view in AAP](https://aap.example.com/execution/templates/job-template/24/details)) | 2026-08-12T15:20:12Z | Payments Automation ([view in AAP](https://aap.example.com/execution/projects/8/details)) | Payments Development ([view in AAP](https://aap.example.com/execution/inventories/inventory/2/details)) | 4 |
 ```
 
 The Markdown summary also counts effective admin, execute, and view grants.
 Each detailed section lists credentials and the access level/source for every
 team. Templates without team access are called out for attention.
+
+Markdown links target the unified Platform Gateway UI under `/execution/`, not
+the JSON API. Configure `AAP_URL` with the Gateway URL so these links open the
+correct AAP 2.5-2.7 interface.
 
 Access levels are reduced to `view`, `execute`, or `admin`. Sources are
 `direct`, `organization_role`, or both. A recently used template with no

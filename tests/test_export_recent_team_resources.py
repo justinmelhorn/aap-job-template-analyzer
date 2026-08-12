@@ -251,8 +251,25 @@ class ExportTests(unittest.TestCase):
         self.assertIn("| Templates with no team access | 1 |", rendered)
         self.assertIn("| Admin grants | 2 |", rendered)
         self.assertIn(
-            "[Payments &#124; Health Check]"
-            "(https://aap.example.com/api/controller/v2/job_templates/10/)",
+            "Payments &#124; Health Check "
+            "([view in AAP](https://aap.example.com/execution/templates/"
+            "job-template/10/details))",
+            rendered,
+        )
+        self.assertIn(
+            "Payments Automation "
+            "([view in AAP](https://aap.example.com/execution/projects/11/details))",
+            rendered,
+        )
+        self.assertIn(
+            "Payments Production "
+            "([view in AAP](https://aap.example.com/execution/inventories/"
+            "inventory/12/details))",
+            rendered,
+        )
+        self.assertIn(
+            "Payments SSH "
+            "([view in AAP](https://aap.example.com/execution/credentials/13/details))",
             rendered,
         )
         self.assertIn("Payments Developers | admin | direct, organization role", rendered)

@@ -119,6 +119,23 @@ def absolute_api_url(client: Client, value: Any, fallback: str) -> str:
     return f"{client.base_url}/{path.lstrip('/')}"
 
 
+def ui_url(client: Client, endpoint: str, item_id: Any, kind: str = "") -> str:
+    routes = {
+        "job_templates": f"/execution/templates/job-template/{item_id}/details",
+        "projects": f"/execution/projects/{item_id}/details",
+        "credentials": f"/execution/credentials/{item_id}/details",
+    }
+    if endpoint == "inventories":
+        inventory_type = {
+            "smart": "smart-inventory",
+            "constructed": "constructed-inventory",
+        }.get(kind, "inventory")
+        path = f"/execution/inventories/{inventory_type}/{item_id}/details"
+    else:
+        path = routes[endpoint]
+    return f"{client.base_url}{path}"
+
+
 def summarized_relation(
     client: Client,
     summary: Any,
@@ -132,6 +149,12 @@ def summarized_relation(
             client,
             summary.get("url"),
             f"{CONTROLLER}/{endpoint}/{summary['id']}/",
+        ),
+        "ui_url": ui_url(
+            client,
+            endpoint,
+            summary["id"],
+            str(summary.get("kind") or ""),
         ),
     }
     return relation
@@ -153,6 +176,7 @@ def template_resource(
             template.get("url"),
             f"{CONTROLLER}/job_templates/{template_id}/",
         ),
+        "ui_url": ui_url(client, "job_templates", template_id),
     }
     if template.get("last_job_run"):
         resource["last_job_run"] = str(template["last_job_run"])
@@ -233,10 +257,11 @@ def markdown_text(value: Any) -> str:
     return html.escape(str(value), quote=False).replace("|", "&#124;").replace("\n", " ")
 
 
-def markdown_link(relation: dict[str, Any]) -> str:
+def markdown_ui_reference(relation: dict[str, Any]) -> str:
     name = markdown_text(relation["name"])
-    url = str(relation["api_url"]).replace(" ", "%20").replace(")", "%29")
-    return f"[{name}]({url})"
+    url = str(relation.get("ui_url") or relation["api_url"])
+    url = url.replace(" ", "%20").replace(")", "%29")
+    return f"{name} ([view in AAP]({url}))"
 
 
 def render_markdown(report: list[dict[str, Any]], days: int, cutoff: str) -> str:
@@ -296,10 +321,10 @@ def render_markdown(report: list[dict[str, Any]], days: int, cutoff: str) -> str
                 "| {organization} | {template} | {last_run} | {project} | "
                 "{inventory} | {teams} |".format(
                     organization=markdown_text(resource["organization"]),
-                    template=markdown_link(resource),
+                    template=markdown_ui_reference(resource),
                     last_run=markdown_text(resource.get("last_job_run", "Unknown")),
-                    project=markdown_link(project) if project else "—",
-                    inventory=markdown_link(inventory) if inventory else "—",
+                    project=markdown_ui_reference(project) if project else "—",
+                    inventory=markdown_ui_reference(inventory) if inventory else "—",
                     teams=len(resource["access"]),
                 )
             )
@@ -315,7 +340,7 @@ def render_markdown(report: list[dict[str, Any]], days: int, cutoff: str) -> str
             [
                 detail_heading,
                 "",
-                f"- **Job Template:** {markdown_link(resource)}",
+                f"- **Job Template:** {markdown_ui_reference(resource)}",
                 f"- **Last run:** `{markdown_text(resource.get('last_job_run', 'Unknown'))}`",
             ]
         )
@@ -323,14 +348,18 @@ def render_markdown(report: list[dict[str, Any]], days: int, cutoff: str) -> str
             lines.append(f"- **Playbook:** `{markdown_text(resource['playbook'])}`")
         for label, field in (("Project", "project"), ("Inventory", "inventory")):
             if resource.get(field):
-                lines.append(f"- **{label}:** {markdown_link(resource[field])}")
+                lines.append(
+                    f"- **{label}:** {markdown_ui_reference(resource[field])}"
+                )
         credentials = resource.get("credentials", [])
         if credentials:
             credential_links = []
             for credential in credentials:
                 credential_type = credential.get("type")
                 suffix = f" (`{markdown_text(credential_type)}`)" if credential_type else ""
-                credential_links.append(f"{markdown_link(credential)}{suffix}")
+                credential_links.append(
+                    f"{markdown_ui_reference(credential)}{suffix}"
+                )
             lines.append(f"- **Credentials:** {', '.join(credential_links)}")
         lines.append("")
         if resource["access"]:
