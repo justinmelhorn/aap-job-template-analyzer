@@ -1,5 +1,6 @@
 lab.env
 team-resources.yaml
+team-resources.md
 .venv/
 __pycache__/
 *.py[cod]
