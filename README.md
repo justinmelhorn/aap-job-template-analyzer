@@ -76,18 +76,22 @@ RBAC, change templates, or clean up AAP data.
 job_templates:
   - name: "Payments | Deploy Development"
     owning_organization: "Payments"
+    ui_url: "https://aap.example.com/execution/templates/job-template/24/details"
     api_url: "https://aap.example.com/api/controller/v2/job_templates/24/"
     last_job_run: "2026-08-12T15:20:12Z"
     playbook: "payments/playbooks/deploy.yml"
     project:
       name: "Payments Automation"
+      ui_url: "https://aap.example.com/execution/projects/8/details"
       api_url: "https://aap.example.com/api/controller/v2/projects/8/"
     inventory:
       name: "Payments Development"
+      ui_url: "https://aap.example.com/execution/inventories/inventory/2/details"
       api_url: "https://aap.example.com/api/controller/v2/inventories/2/"
     credentials:
       - name: "Payments Target SSH"
         type: "ssh"
+        ui_url: "https://aap.example.com/execution/credentials/3/details"
         api_url: "https://aap.example.com/api/controller/v2/credentials/3/"
     launch_prompts:
       inventory:
@@ -100,6 +104,7 @@ job_templates:
         defaults:
           - name: "Payments Target SSH"
             type: "ssh"
+            ui_url: "https://aap.example.com/execution/credentials/3/details"
             api_url: "https://aap.example.com/api/controller/v2/credentials/3/"
     access:
       - team_organization: "Payments"
@@ -179,9 +184,13 @@ inventory or credential access that the team-only report intentionally does
 not enumerate. The reporter does not attempt to prove credential-type
 compatibility or enumerate users.
 
-The credential entries contain only names, types, and API URLs. The reporter
-does not request or export passwords, tokens, private keys, or credential
-inputs.
+Every template and related resource includes both a human-facing `ui_url` and
+a stable machine-facing `api_url`. This makes the YAML useful in review emails
+while preserving the API reference for automation.
+
+The credential entries contain only names, types, UI URLs, and API URLs. The
+reporter does not request or export passwords, tokens, private keys, or
+credential inputs.
 
 ## What the report means
 
