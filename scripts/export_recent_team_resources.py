@@ -5,12 +5,12 @@ Output is deliberately compact:
 
 job_templates:
   - name: Job Template
-    organization: Owning Organization
+    owning_organization: Owning Organization
     api_url: https://aap.example/api/controller/v2/job_templates/1/
     project: {name, api_url}
     inventory: {name, api_url}
     credentials: [{name, type, api_url}]
-    access: [{organization, team, level, sources}]
+    access: [{team_organization, team, level, can_execute, sources, launch_readiness}]
 
 This is a current-access report filtered by Job Template.last_job_run. It is
 not a historical reconstruction of permissions that were later revoked.
@@ -119,6 +119,23 @@ def absolute_api_url(client: Client, value: Any, fallback: str) -> str:
     return f"{client.base_url}/{path.lstrip('/')}"
 
 
+def ui_url(client: Client, endpoint: str, item_id: Any, kind: str = "") -> str:
+    routes = {
+        "job_templates": f"/execution/templates/job-template/{item_id}/details",
+        "projects": f"/execution/projects/{item_id}/details",
+        "credentials": f"/execution/credentials/{item_id}/details",
+    }
+    if endpoint == "inventories":
+        inventory_type = {
+            "smart": "smart-inventory",
+            "constructed": "constructed-inventory",
+        }.get(kind, "inventory")
+        path = f"/execution/inventories/{inventory_type}/{item_id}/details"
+    else:
+        path = routes[endpoint]
+    return f"{client.base_url}{path}"
+
+
 def summarized_relation(
     client: Client,
     summary: Any,
@@ -133,6 +150,12 @@ def summarized_relation(
             summary.get("url"),
             f"{CONTROLLER}/{endpoint}/{summary['id']}/",
         ),
+        "ui_url": ui_url(
+            client,
+            endpoint,
+            summary["id"],
+            str(summary.get("kind") or ""),
+        ),
     }
     return relation
 
@@ -141,18 +164,20 @@ def template_resource(
     client: Client,
     template: dict[str, Any],
     organizations: dict[int, str],
+    launch: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Return useful non-secret metadata already exposed by the template API."""
     template_id = template["id"]
     summary = template.get("summary_fields", {})
     resource: dict[str, Any] = {
         "name": str(template["name"]),
-        "organization": organization_name(template, organizations),
+        "owning_organization": organization_name(template, organizations),
         "api_url": absolute_api_url(
             client,
             template.get("url"),
             f"{CONTROLLER}/job_templates/{template_id}/",
         ),
+        "ui_url": ui_url(client, "job_templates", template_id),
     }
     if template.get("last_job_run"):
         resource["last_job_run"] = str(template["last_job_run"])
@@ -182,6 +207,19 @@ def template_resource(
         resource["credentials"] = sorted(
             credentials, key=lambda item: item["name"].casefold()
         )
+    launch = launch or {}
+    resource["launch_prompts"] = {
+        "inventory": {
+            "enabled": bool(template.get("ask_inventory_on_launch")),
+            "required": bool(launch.get("inventory_needed_to_start")),
+            "default": inventory,
+        },
+        "credentials": {
+            "enabled": bool(template.get("ask_credential_on_launch")),
+            "required": bool(launch.get("credential_needed_to_start")),
+            "defaults": resource.get("credentials", []),
+        },
+    }
     return resource
 
 
@@ -192,13 +230,33 @@ def render_relation(lines: list[str], indent: str, relation: dict[str, str]) -> 
     lines.append(f"{indent}api_url: {yaml_string(relation['api_url'])}")
 
 
+def yaml_bool(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def render_prompt_relation(
+    lines: list[str],
+    indent: str,
+    field: str,
+    relation: Optional[dict[str, str]],
+) -> None:
+    if relation is None:
+        lines.append(f"{indent}{field}: null")
+        return
+    lines.append(f"{indent}{field}:")
+    render_relation(lines, f"{indent}  ", relation)
+
+
 def render_yaml(report: list[dict[str, Any]]) -> str:
     if not report:
         return "job_templates: []\n"
     lines = ["job_templates:"]
     for resource in report:
         lines.append(f"  - name: {yaml_string(resource['name'])}")
-        lines.append(f"    organization: {yaml_string(resource['organization'])}")
+        lines.append(
+            "    owning_organization: "
+            f"{yaml_string(resource['owning_organization'])}"
+        )
         lines.append(f"    api_url: {yaml_string(resource['api_url'])}")
         for field in ("last_job_run", "playbook"):
             if resource.get(field):
@@ -214,17 +272,62 @@ def render_yaml(report: list[dict[str, Any]]) -> str:
                 if credential.get("type"):
                     lines.append(f"        type: {yaml_string(credential['type'])}")
                 lines.append(f"        api_url: {yaml_string(credential['api_url'])}")
+        prompts = resource["launch_prompts"]
+        inventory_prompt = prompts["inventory"]
+        credential_prompt = prompts["credentials"]
+        lines.append("    launch_prompts:")
+        lines.append("      inventory:")
+        lines.append(
+            f"        enabled: {yaml_bool(inventory_prompt['enabled'])}"
+        )
+        lines.append(
+            f"        required: {yaml_bool(inventory_prompt['required'])}"
+        )
+        render_prompt_relation(
+            lines, "        ", "default", inventory_prompt["default"]
+        )
+        lines.append("      credentials:")
+        lines.append(
+            f"        enabled: {yaml_bool(credential_prompt['enabled'])}"
+        )
+        lines.append(
+            f"        required: {yaml_bool(credential_prompt['required'])}"
+        )
+        defaults = credential_prompt["defaults"]
+        if defaults:
+            lines.append("        defaults:")
+            for credential in defaults:
+                lines.append(f"          - name: {yaml_string(credential['name'])}")
+                if credential.get("type"):
+                    lines.append(f"            type: {yaml_string(credential['type'])}")
+                lines.append(
+                    f"            api_url: {yaml_string(credential['api_url'])}"
+                )
+        else:
+            lines.append("        defaults: []")
         if not resource["access"]:
             lines.append("    access: []")
             continue
         lines.append("    access:")
         for access in resource["access"]:
-            lines.append(f"      - organization: {yaml_string(access['organization'])}")
+            lines.append(
+                "      - team_organization: "
+                f"{yaml_string(access['team_organization'])}"
+            )
             lines.append(f"        team: {yaml_string(access['team'])}")
             lines.append(f"        level: {yaml_string(access['level'])}")
+            lines.append(
+                f"        can_execute: {yaml_bool(access['can_execute'])}"
+            )
             lines.append("        sources:")
             for source in access["sources"]:
                 lines.append(f"          - {yaml_string(source)}")
+            readiness = access["launch_readiness"]
+            lines.append("        launch_readiness:")
+            for field in ("status", "inventory", "credentials"):
+                lines.append(
+                    f"          {field}: {yaml_string(readiness[field])}"
+                )
     return "\n".join(lines) + "\n"
 
 
@@ -233,17 +336,18 @@ def markdown_text(value: Any) -> str:
     return html.escape(str(value), quote=False).replace("|", "&#124;").replace("\n", " ")
 
 
-def markdown_link(relation: dict[str, Any]) -> str:
+def markdown_ui_reference(relation: dict[str, Any]) -> str:
     name = markdown_text(relation["name"])
-    url = str(relation["api_url"]).replace(" ", "%20").replace(")", "%29")
-    return f"[{name}]({url})"
+    url = str(relation.get("ui_url") or relation["api_url"])
+    url = url.replace(" ", "%20").replace(")", "%29")
+    return f"{name} ([view in AAP]({url}))"
 
 
 def render_markdown(report: list[dict[str, Any]], days: int, cutoff: str) -> str:
     """Render a concise human-readable companion to the YAML report."""
-    organizations = {item["organization"] for item in report}
+    organizations = {item["owning_organization"] for item in report}
     teams = {
-        (access["organization"], access["team"])
+        (access["team_organization"], access["team"])
         for item in report
         for access in item["access"]
     }
@@ -256,6 +360,27 @@ def render_markdown(report: list[dict[str, Any]], days: int, cutoff: str) -> str
         for level in ("admin", "execute", "view")
     }
     without_access = sum(not item["access"] for item in report)
+    prompted_templates = sum(
+        any(prompt["enabled"] for prompt in item["launch_prompts"].values())
+        for item in report
+    )
+    required_selections = sum(
+        prompt["enabled"]
+        and prompt["required"]
+        and not (prompt.get("default") or prompt.get("defaults"))
+        for item in report
+        for prompt in item["launch_prompts"].values()
+    )
+    cross_organization = sum(
+        access["team_organization"] != item["owning_organization"]
+        for item in report
+        for access in item["access"]
+    )
+    readiness_attention = sum(
+        access["launch_readiness"]["status"] == "attention"
+        for item in report
+        for access in item["access"]
+    )
 
     lines = [
         "# AAP Job Template Access Report",
@@ -273,6 +398,10 @@ def render_markdown(report: list[dict[str, Any]], days: int, cutoff: str) -> str
         f"| Owning organizations | {len(organizations)} |",
         f"| Teams with access | {len(teams)} |",
         f"| Templates with no team access | {without_access} |",
+        f"| Templates with launch prompts | {prompted_templates} |",
+        f"| Required selections without defaults | {required_selections} |",
+        f"| Cross-organization team grants | {cross_organization} |",
+        f"| Team readiness entries needing review | {readiness_attention} |",
         f"| Admin grants | {level_counts['admin']} |",
         f"| Execute grants | {level_counts['execute']} |",
         f"| View grants | {level_counts['view']} |",
@@ -295,11 +424,11 @@ def render_markdown(report: list[dict[str, Any]], days: int, cutoff: str) -> str
             lines.append(
                 "| {organization} | {template} | {last_run} | {project} | "
                 "{inventory} | {teams} |".format(
-                    organization=markdown_text(resource["organization"]),
-                    template=markdown_link(resource),
+                    organization=markdown_text(resource["owning_organization"]),
+                    template=markdown_ui_reference(resource),
                     last_run=markdown_text(resource.get("last_job_run", "Unknown")),
-                    project=markdown_link(project) if project else "—",
-                    inventory=markdown_link(inventory) if inventory else "—",
+                    project=markdown_ui_reference(project) if project else "—",
+                    inventory=markdown_ui_reference(inventory) if inventory else "—",
                     teams=len(resource["access"]),
                 )
             )
@@ -308,50 +437,124 @@ def render_markdown(report: list[dict[str, Any]], days: int, cutoff: str) -> str
     lines.extend(["## Details", ""])
     for resource in report:
         detail_heading = (
-            f"### {markdown_text(resource['organization'])} — "
+            f"### {markdown_text(resource['owning_organization'])} — "
             f"{markdown_text(resource['name'])}"
         )
         lines.extend(
             [
                 detail_heading,
                 "",
-                f"- **Job Template:** {markdown_link(resource)}",
+                f"- **Job Template:** {markdown_ui_reference(resource)}",
                 f"- **Last run:** `{markdown_text(resource.get('last_job_run', 'Unknown'))}`",
             ]
         )
         if resource.get("playbook"):
             lines.append(f"- **Playbook:** `{markdown_text(resource['playbook'])}`")
-        for label, field in (("Project", "project"), ("Inventory", "inventory")):
-            if resource.get(field):
-                lines.append(f"- **{label}:** {markdown_link(resource[field])}")
-        credentials = resource.get("credentials", [])
-        if credentials:
-            credential_links = []
-            for credential in credentials:
-                credential_type = credential.get("type")
-                suffix = f" (`{markdown_text(credential_type)}`)" if credential_type else ""
-                credential_links.append(f"{markdown_link(credential)}{suffix}")
-            lines.append(f"- **Credentials:** {', '.join(credential_links)}")
+        if resource.get("project"):
+            lines.append(
+                f"- **Project:** {markdown_ui_reference(resource['project'])}"
+            )
+        inventory_prompt = resource["launch_prompts"]["inventory"]
+        inventory = inventory_prompt["default"]
+        if inventory_prompt["enabled"]:
+            if inventory:
+                inventory_text = (
+                    "Prompted at launch; default: "
+                    f"{markdown_ui_reference(inventory)}"
+                )
+            elif inventory_prompt["required"]:
+                inventory_text = "Prompted at launch; selection required; no default"
+            else:
+                inventory_text = "Prompted at launch; no default"
+        else:
+            inventory_text = (
+                f"Fixed: {markdown_ui_reference(inventory)}"
+                if inventory
+                else "Fixed; none configured"
+            )
+        lines.append(f"- **Inventory:** {inventory_text}")
+
+        credential_prompt = resource["launch_prompts"]["credentials"]
+        credentials = credential_prompt["defaults"]
+        credential_links = []
+        for credential in credentials:
+            credential_type = credential.get("type")
+            suffix = f" (`{markdown_text(credential_type)}`)" if credential_type else ""
+            credential_links.append(f"{markdown_ui_reference(credential)}{suffix}")
+        credential_defaults = ", ".join(credential_links)
+        if credential_prompt["enabled"]:
+            if credential_defaults:
+                credential_text = (
+                    "Prompted at launch; defaults: " + credential_defaults
+                )
+            elif credential_prompt["required"]:
+                credential_text = "Prompted at launch; selection required; no default"
+            else:
+                credential_text = "Prompted at launch; optional; no default"
+        else:
+            credential_text = (
+                "Fixed: " + credential_defaults
+                if credential_defaults
+                else "Fixed; none configured"
+            )
+        lines.append(f"- **Credentials:** {credential_text}")
         lines.append("")
         if resource["access"]:
-            lines.extend(
-                [
-                    "| Team organization | Team | Access | Source |",
-                    "| --- | --- | --- | --- |",
-                ]
-            )
+            access_by_organization: dict[str, list[dict[str, Any]]] = defaultdict(list)
             for access in resource["access"]:
-                sources = ", ".join(
-                    source.replace("organization_role", "organization role")
-                    for source in access["sources"]
+                access_by_organization[access["team_organization"]].append(access)
+            for team_organization in sorted(
+                access_by_organization, key=str.casefold
+            ):
+                relationship = (
+                    "same as template owner"
+                    if team_organization == resource["owning_organization"]
+                    else "cross-organization access"
                 )
-                lines.append(
-                    f"| {markdown_text(access['organization'])} | "
-                    f"{markdown_text(access['team'])} | {access['level']} | {sources} |"
+                lines.extend(
+                    [
+                        f"#### Teams from {markdown_text(team_organization)} — {relationship}",
+                        "",
+                        "| Team | Effective access | Grant path | Launch readiness |",
+                        "| --- | --- | --- | --- |",
+                    ]
                 )
+                for access in access_by_organization[team_organization]:
+                    source_labels = {
+                        "job_template_assignment": "Job Template assignment",
+                        "owning_organization_assignment": (
+                            "Owning Organization assignment"
+                        ),
+                    }
+                    sources = ", ".join(
+                        source_labels[source] for source in access["sources"]
+                    )
+                    readiness = access["launch_readiness"]
+                    readiness_labels = {
+                        "ready": "Ready",
+                        "attention": "Attention",
+                        "not_applicable": "Not applicable",
+                        "fixed": "fixed",
+                        "default_prompt": "prompted default",
+                        "team_selection": "team selection",
+                        "optional": "optional",
+                        "team_access_not_evidenced": "team access not evidenced",
+                    }
+                    readiness_text = readiness_labels[readiness["status"]]
+                    if readiness["status"] != "not_applicable":
+                        readiness_text += (
+                            f" — inventory: {readiness_labels[readiness['inventory']]}; "
+                            "credentials: "
+                            f"{readiness_labels[readiness['credentials']]}"
+                        )
+                    lines.append(
+                        f"| {markdown_text(access['team'])} | "
+                        f"{access['level']} | {sources} | {readiness_text} |"
+                    )
+                lines.append("")
         else:
             lines.append("**Attention:** No current team access was found.")
-        lines.append("")
+            lines.append("")
 
     lines.extend(
         [
@@ -361,6 +564,10 @@ def render_markdown(report: list[dict[str, Any]], days: int, cutoff: str) -> str
                 "This is a snapshot of current team RBAC filtered by Job Template "
                 "`last_job_run`; it is not a historical reconstruction of revoked access."
             ),
+            (
+                "Launch readiness is derived only from team assignments. Direct user "
+                "roles can add access, so an attention result is not a definitive denial."
+            ),
             "",
         ]
     )
@@ -369,7 +576,6 @@ def render_markdown(report: list[dict[str, Any]], days: int, cutoff: str) -> str
 
 def effective_access_level(permissions: set[str]) -> Optional[str]:
     if permissions & {
-        "awx.add_jobtemplate",
         "awx.change_jobtemplate",
         "awx.delete_jobtemplate",
     }:
@@ -379,6 +585,85 @@ def effective_access_level(permissions: set[str]) -> Optional[str]:
     if "awx.view_jobtemplate" in permissions:
         return "view"
     return None
+
+
+def prompt_readiness(
+    resource: dict[str, Any],
+    can_execute: bool,
+    has_inventory_selection: bool,
+    has_credential_selection: bool,
+) -> dict[str, str]:
+    if not can_execute:
+        return {
+            "status": "not_applicable",
+            "inventory": "not_applicable",
+            "credentials": "not_applicable",
+        }
+
+    prompts = resource["launch_prompts"]
+    inventory = prompts["inventory"]
+    credentials = prompts["credentials"]
+    if not inventory["enabled"]:
+        inventory_status = "fixed"
+    elif inventory["default"]:
+        inventory_status = "default_prompt"
+    elif has_inventory_selection:
+        inventory_status = "team_selection"
+    else:
+        inventory_status = "team_access_not_evidenced"
+
+    if not credentials["enabled"]:
+        credential_status = "fixed"
+    elif credentials["defaults"]:
+        credential_status = "default_prompt"
+    elif not credentials["required"]:
+        credential_status = "optional"
+    elif has_credential_selection:
+        credential_status = "team_selection"
+    else:
+        credential_status = "team_access_not_evidenced"
+
+    needs_attention = (
+        inventory["required"]
+        and inventory_status == "team_access_not_evidenced"
+    ) or (
+        credentials["required"]
+        and credential_status == "team_access_not_evidenced"
+    )
+    return {
+        "status": "attention" if needs_attention else "ready",
+        "inventory": inventory_status,
+        "credentials": credential_status,
+    }
+
+
+def organization_has_resource(
+    client: Client,
+    endpoint: str,
+    organization_name_value: str,
+    cache: dict[tuple[str, str], bool],
+    controller_organization_cache: dict[str, Optional[int]],
+) -> bool:
+    key = (endpoint, organization_name_value)
+    if key not in cache:
+        if organization_name_value not in controller_organization_cache:
+            organizations = client.get(
+                f"{CONTROLLER}/organizations/",
+                {"name": organization_name_value, "page_size": 1},
+            ).get("results", [])
+            controller_organization_cache[organization_name_value] = (
+                int(organizations[0]["id"]) if organizations else None
+            )
+        organization_id = controller_organization_cache[organization_name_value]
+        if organization_id is None:
+            cache[key] = False
+            return False
+        payload = client.get(
+            f"{CONTROLLER}/{endpoint}/",
+            {"organization": organization_id, "page_size": 1},
+        )
+        cache[key] = bool(payload.get("count") or payload.get("results"))
+    return cache[key]
 
 
 def rbac_base(client: Client) -> str:
@@ -415,9 +700,18 @@ def build_report(client: Client, days: int) -> tuple[list[dict[str, Any]], str]:
     access_by_template: dict[str, dict[int, dict[str, Any]]] = defaultdict(dict)
     for template in recent:
         template_id = str(template["id"])
-        resource = template_resource(client, template, organizations)
+        prompted = bool(
+            template.get("ask_inventory_on_launch")
+            or template.get("ask_credential_on_launch")
+        )
+        launch = (
+            client.get(f"{CONTROLLER}/job_templates/{template_id}/launch/")
+            if prompted
+            else None
+        )
+        resource = template_resource(client, template, organizations, launch)
         report_by_id[template_id] = resource
-        templates_by_org[resource["organization"]].append(template)
+        templates_by_org[resource["owning_organization"]].append(template)
 
     teams = client.list(f"{base}/teams/")
     teams_by_id = {
@@ -432,29 +726,41 @@ def build_report(client: Client, days: int) -> tuple[list[dict[str, Any]], str]:
     }
     assignments = client.list(f"{base}/role_team_assignments/")
 
-    level_rank = {"view": 1, "execute": 2, "admin": 3}
-    source_rank = {"direct": 1, "organization_role": 2}
+    source_rank = {
+        "job_template_assignment": 1,
+        "owning_organization_assignment": 2,
+    }
+    team_use: dict[int, dict[str, set[Any]]] = defaultdict(
+        lambda: {
+            "inventory_objects": set(),
+            "credential_objects": set(),
+            "inventory_organizations": set(),
+            "credential_organizations": set(),
+        }
+    )
 
     def add_access(
         template: dict[str, Any],
         team_id: int,
         team_org: str,
         team_name: str,
-        level: str,
+        permissions: set[str],
         source: str,
     ) -> None:
         template_access = access_by_template[str(template["id"])]
         existing = template_access.get(team_id)
         if existing is None:
             template_access[team_id] = {
-                "organization": team_org,
+                "team_organization": team_org,
                 "team": team_name,
-                "level": level,
+                "_team_id": team_id,
+                "_permissions": set(permissions),
+                "level": effective_access_level(permissions),
                 "sources": {source},
             }
             return
-        if level_rank[level] > level_rank[existing["level"]]:
-            existing["level"] = level
+        existing["_permissions"].update(permissions)
+        existing["level"] = effective_access_level(existing["_permissions"])
         existing["sources"].add(source)
 
     for assignment in assignments:
@@ -465,20 +771,37 @@ def build_report(client: Client, days: int) -> tuple[list[dict[str, Any]], str]:
         team_org, team_name = teams_by_id[team_id]
         definition = definitions[definition_id]
         permissions = set(definition.get("permissions", []))
-        level = effective_access_level(permissions)
-        if level is None:
-            continue
         content_type = str(
             assignment.get("content_type") or definition.get("content_type") or ""
         )
+        object_reference = assignment.get("object_id") or assignment.get(
+            "object_ansible_id"
+        )
+
+        if content_type == "awx.inventory" and "awx.use_inventory" in permissions:
+            if object_reference is not None:
+                team_use[team_id]["inventory_objects"].add(str(object_reference))
+            continue
+
+        if content_type == "awx.credential" and "awx.use_credential" in permissions:
+            if object_reference is not None:
+                team_use[team_id]["credential_objects"].add(str(object_reference))
+            continue
 
         if content_type == "awx.jobtemplate":
+            if effective_access_level(permissions) is None:
+                continue
             template = recent_by_id.get(str(assignment.get("object_id")))
             if template is None and assignment.get("object_ansible_id"):
                 template = recent_by_ansible_id.get(str(assignment["object_ansible_id"]))
             if template:
                 add_access(
-                    template, team_id, team_org, team_name, level, "direct"
+                    template,
+                    team_id,
+                    team_org,
+                    team_name,
+                    permissions,
+                    "job_template_assignment",
                 )
             continue
 
@@ -493,38 +816,84 @@ def build_report(client: Client, days: int) -> tuple[list[dict[str, Any]], str]:
                     .get("name")
                 )
             if object_org:
-                for template in templates_by_org.get(str(object_org), []):
-                    add_access(
-                        template,
-                        team_id,
-                        team_org,
-                        team_name,
-                        level,
-                        "organization_role",
-                    )
+                object_org = str(object_org)
+                if "awx.use_inventory" in permissions:
+                    team_use[team_id]["inventory_organizations"].add(object_org)
+                if "awx.use_credential" in permissions:
+                    team_use[team_id]["credential_organizations"].add(object_org)
+                if effective_access_level(permissions) is not None:
+                    for template in templates_by_org.get(object_org, []):
+                        add_access(
+                            template,
+                            team_id,
+                            team_org,
+                            team_name,
+                            permissions,
+                            "owning_organization_assignment",
+                        )
 
     report: list[dict[str, Any]] = []
+    organization_resource_cache: dict[tuple[str, str], bool] = {}
+    controller_organization_cache: dict[str, Optional[int]] = {}
+
+    def has_team_selection(team_id: int, resource_type: str) -> bool:
+        access = team_use[team_id]
+        if access[f"{resource_type}_objects"]:
+            return True
+        endpoint = "inventories" if resource_type == "inventory" else "credentials"
+        return any(
+            organization_has_resource(
+                client,
+                endpoint,
+                organization,
+                organization_resource_cache,
+                controller_organization_cache,
+            )
+            for organization in access[f"{resource_type}_organizations"]
+        )
+
     for template_id, resource in report_by_id.items():
         access_entries = access_by_template.get(template_id, {}).values()
+        rendered_access = []
+        for entry in access_entries:
+            permissions = entry.pop("_permissions")
+            team_id = entry.pop("_team_id")
+            entry["can_execute"] = "awx.execute_jobtemplate" in permissions
+            entry["sources"] = sorted(
+                entry["sources"], key=lambda source: source_rank[source]
+            )
+            prompts = resource["launch_prompts"]
+            needs_inventory_selection = (
+                prompts["inventory"]["enabled"]
+                and not prompts["inventory"]["default"]
+            )
+            needs_credential_selection = (
+                prompts["credentials"]["enabled"]
+                and prompts["credentials"]["required"]
+                and not prompts["credentials"]["defaults"]
+            )
+            entry["launch_readiness"] = prompt_readiness(
+                resource,
+                entry["can_execute"],
+                has_team_selection(team_id, "inventory")
+                if needs_inventory_selection
+                else False,
+                has_team_selection(team_id, "credential")
+                if needs_credential_selection
+                else False,
+            )
+            rendered_access.append(entry)
         resource["access"] = sorted(
-            (
-                {
-                    **entry,
-                    "sources": sorted(
-                        entry["sources"], key=lambda source: source_rank[source]
-                    ),
-                }
-                for entry in access_entries
-            ),
+            rendered_access,
             key=lambda entry: (
-                entry["organization"].casefold(),
+                entry["team_organization"].casefold(),
                 entry["team"].casefold(),
             ),
         )
         report.append(resource)
     report.sort(
         key=lambda resource: (
-            resource["organization"].casefold(),
+            resource["owning_organization"].casefold(),
             resource["name"].casefold(),
         )
     )

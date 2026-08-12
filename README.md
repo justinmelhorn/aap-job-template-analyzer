@@ -3,7 +3,8 @@
 This read-only Python utility exports one YAML record for every Ansible
 Automation Platform Job Template run during a selected period. Each record
 contains the template's related resources and the teams that can currently
-access it.
+access it. When a template prompts for inventory or credentials at launch, the
+report also provides a conservative team-derived readiness assessment.
 
 ## Requirements
 
@@ -57,8 +58,9 @@ python3 scripts/export_recent_team_resources.py \
 ```
 
 The YAML is the machine-readable source. The optional Markdown companion adds
-a summary, a compact template table, clickable AAP resource links, and detailed
-team-access tables for easy review in GitHub or any Markdown viewer.
+a summary, a compact template table, friendly `([view in AAP](...))` UI links,
+and detailed team-access tables for easy review in GitHub or any Markdown
+viewer. YAML continues to expose stable API URLs for automation.
 
 Omit `--output` to write YAML to standard output. Omit `--markdown-output` if
 you only need YAML. `--days` must be at least 1 and defaults to 365.
@@ -73,7 +75,7 @@ RBAC, change templates, or clean up AAP data.
 ```yaml
 job_templates:
   - name: "Payments | Deploy Development"
-    organization: "Payments"
+    owning_organization: "Payments"
     api_url: "https://aap.example.com/api/controller/v2/job_templates/24/"
     last_job_run: "2026-08-12T15:20:12Z"
     playbook: "payments/playbooks/deploy.yml"
@@ -87,12 +89,29 @@ job_templates:
       - name: "Payments Target SSH"
         type: "ssh"
         api_url: "https://aap.example.com/api/controller/v2/credentials/3/"
+    launch_prompts:
+      inventory:
+        enabled: true
+        required: true
+        default: null
+      credentials:
+        enabled: true
+        required: false
+        defaults:
+          - name: "Payments Target SSH"
+            type: "ssh"
+            api_url: "https://aap.example.com/api/controller/v2/credentials/3/"
     access:
-      - organization: "Payments"
+      - team_organization: "Payments"
         team: "Payments Developers"
         level: "execute"
+        can_execute: true
         sources:
-          - "direct"
+          - "job_template_assignment"
+        launch_readiness:
+          status: "attention"
+          inventory: "team_access_not_evidenced"
+          credentials: "default_prompt"
 ```
 
 ### Markdown summary
@@ -108,21 +127,57 @@ job_templates:
 | Owning organizations | 1 |
 | Teams with access | 4 |
 | Templates with no team access | 0 |
+| Templates with launch prompts | 1 |
+| Required selections without defaults | 1 |
+| Cross-organization team grants | 1 |
+| Team readiness entries needing review | 1 |
 
 ## Templates
 
 | Organization | Job Template | Last run | Project | Inventory | Teams |
 | --- | --- | --- | --- | --- | ---: |
-| Payments | Payments \| Deploy Development | 2026-08-12T15:20:12Z | Payments Automation | Payments Development | 4 |
+| Payments | Payments \| Deploy Development ([view in AAP](https://aap.example.com/execution/templates/job-template/24/details)) | 2026-08-12T15:20:12Z | Payments Automation ([view in AAP](https://aap.example.com/execution/projects/8/details)) | Payments Development ([view in AAP](https://aap.example.com/execution/inventories/inventory/2/details)) | 4 |
 ```
 
 The Markdown summary also counts effective admin, execute, and view grants.
-Each detailed section lists credentials and the access level/source for every
-team. Templates without team access are called out for attention.
+Each detailed section lists credentials and groups teams by their home
+organization. Each group is marked as either the same as the template owner or
+cross-organization access. The table shows effective access, grant path, and
+launch readiness. Templates without team access are called out for attention.
 
-Access levels are reduced to `view`, `execute`, or `admin`. Sources are
-`direct`, `organization_role`, or both. A recently used template with no
+Markdown links target the unified Platform Gateway UI under `/execution/`, not
+the JSON API. Configure `AAP_URL` with the Gateway URL so these links open the
+correct AAP 2.5-2.7 interface.
+
+Access levels are reduced to `view`, `execute`, or `admin`. `can_execute` is
+retained separately: a custom change-only role can display as `admin` without
+being misrepresented as executable. Sources are `job_template_assignment`,
+`owning_organization_assignment`, or both. A recently used template with no
 current team assignment is retained with `access: []`.
+
+### Launch prompts and readiness
+
+For a recent template with inventory or credential prompting enabled, the
+report sends a read-only `GET` to that template's `/launch/` endpoint. It
+distinguishes fixed configuration, prompted defaults, required selection
+without a default, and optional credentials.
+
+Readiness is intentionally team-only and conservative:
+
+- `fixed`: prompting is disabled and the template configuration applies.
+- `default_prompt`: a launcher may accept the configured default.
+- `team_selection`: a matching team `use` grant was found, directly or through
+  an applicable organization role.
+- `optional`: no credential selection is required.
+- `team_access_not_evidenced`: a required team-provided selection was not
+  found.
+- `not_applicable`: the team does not have Job Template execute permission.
+
+The overall status is `ready`, `attention`, or `not_applicable`. `attention`
+is not a definitive denial: a user's direct roles may provide additional
+inventory or credential access that the team-only report intentionally does
+not enumerate. The reporter does not attempt to prove credential-type
+compatibility or enumerate users.
 
 The credential entries contain only names, types, and API URLs. The reporter
 does not request or export passwords, tokens, private keys, or credential
@@ -135,9 +190,8 @@ retained job records. Normal job cleanup can delete job records without
 preventing the template from appearing, provided AAP retains that timestamp.
 
 Team access is a snapshot of current RBAC. It cannot reconstruct a role that
-was revoked earlier in the reporting period. The organization on a template is
-its owning organization; the organization on an access entry is that team's
-home organization.
+was revoked earlier in the reporting period. `owning_organization` is the
+template owner; `team_organization` is the team's home organization.
 
 The script supports the Controller 4.6-4.8 API layout used by AAP 2.5-2.7. It
 uses Controller RBAC endpoints for Controller 4.6 and Gateway RBAC endpoints
