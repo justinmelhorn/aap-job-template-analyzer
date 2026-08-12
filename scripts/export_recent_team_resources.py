@@ -227,6 +227,7 @@ def render_relation(lines: list[str], indent: str, relation: dict[str, str]) -> 
     lines.append(f"{indent}name: {yaml_string(relation['name'])}")
     if relation.get("type"):
         lines.append(f"{indent}type: {yaml_string(relation['type'])}")
+    lines.append(f"{indent}ui_url: {yaml_string(relation['ui_url'])}")
     lines.append(f"{indent}api_url: {yaml_string(relation['api_url'])}")
 
 
@@ -257,6 +258,7 @@ def render_yaml(report: list[dict[str, Any]]) -> str:
             "    owning_organization: "
             f"{yaml_string(resource['owning_organization'])}"
         )
+        lines.append(f"    ui_url: {yaml_string(resource['ui_url'])}")
         lines.append(f"    api_url: {yaml_string(resource['api_url'])}")
         for field in ("last_job_run", "playbook"):
             if resource.get(field):
@@ -271,6 +273,7 @@ def render_yaml(report: list[dict[str, Any]]) -> str:
                 lines.append(f"      - name: {yaml_string(credential['name'])}")
                 if credential.get("type"):
                     lines.append(f"        type: {yaml_string(credential['type'])}")
+                lines.append(f"        ui_url: {yaml_string(credential['ui_url'])}")
                 lines.append(f"        api_url: {yaml_string(credential['api_url'])}")
         prompts = resource["launch_prompts"]
         inventory_prompt = prompts["inventory"]
@@ -300,6 +303,9 @@ def render_yaml(report: list[dict[str, Any]]) -> str:
                 lines.append(f"          - name: {yaml_string(credential['name'])}")
                 if credential.get("type"):
                     lines.append(f"            type: {yaml_string(credential['type'])}")
+                lines.append(
+                    f"            ui_url: {yaml_string(credential['ui_url'])}"
+                )
                 lines.append(
                     f"            api_url: {yaml_string(credential['api_url'])}"
                 )

@@ -346,6 +346,25 @@ class ExportTests(unittest.TestCase):
         )
         rendered = MODULE.render_yaml([payments])
         self.assertIn('    owning_organization: "Payments"', rendered)
+        self.assertIn(
+            '    ui_url: "https://aap.example.com/execution/templates/'
+            'job-template/10/details"',
+            rendered,
+        )
+        self.assertIn(
+            '      ui_url: "https://aap.example.com/execution/projects/11/details"',
+            rendered,
+        )
+        self.assertIn(
+            '      ui_url: "https://aap.example.com/execution/inventories/'
+            'inventory/12/details"',
+            rendered,
+        )
+        self.assertIn(
+            '        ui_url: "https://aap.example.com/execution/credentials/'
+            '13/details"',
+            rendered,
+        )
         self.assertIn("    launch_prompts:\n      inventory:", rendered)
         self.assertIn("        enabled: false\n        required: false", rendered)
         self.assertIn('      - team_organization: "Payments"', rendered)
