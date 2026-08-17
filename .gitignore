@@ -1,7 +1,10 @@
 lab.env
 team-resources.yaml
 team-resources.md
+team-resources.pdf
 team-job-template-roles.pdf
+job-template-identity-access.yaml
+job-template-identity-access.pdf
 .venv/
 __pycache__/
 *.py[cod]

@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 MODULE_PATH = Path(__file__).parents[1] / "scripts" / "export_recent_team_resources.py"
+sys.path.insert(0, str(MODULE_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("export_recent_team_resources", MODULE_PATH)
 assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -516,6 +517,31 @@ class ExportTests(unittest.TestCase):
         rendered = MODULE.render_markdown([], 30, "2026-07-13T00:00:00Z")
         self.assertIn("| Recently used Job Templates | 0 |", rendered)
         self.assertIn("No Job Templates matched the selected period.", rendered)
+
+    def test_pdf_contains_summary_templates_and_team_access(self):
+        report, _ = MODULE.build_report(FakeClient(), 365)
+        rendered = MODULE.render_pdf(report, 365, "2025-08-17T00:00:00Z")
+        self.assertTrue(rendered.startswith(b"%PDF-1.4"))
+        self.assertTrue(rendered.endswith(b"%%EOF\n"))
+        self.assertIn(b"AAP Job Template Access Report", rendered)
+        self.assertIn(b"Payments | Health Check", rendered)
+        self.assertIn(b"Payments Developers", rendered)
+        self.assertIn(b"Team access", rendered)
+
+    def test_pdf_paginates_large_reports(self):
+        report, _ = MODULE.build_report(FakeClient(), 365)
+        seed = report[0]
+        expanded = [
+            {
+                **seed,
+                "name": f"Payments | Long Running Deployment Template {index:02d}",
+            }
+            for index in range(30)
+        ]
+        rendered = MODULE.render_pdf(expanded, 365, "2025-08-17T00:00:00Z")
+        self.assertGreaterEqual(rendered.count(b"/Type /Page "), 5)
+        self.assertGreaterEqual(rendered.count(b"(Organization) Tj"), 2)
+        self.assertIn(b"- continued", rendered)
 
 
 if __name__ == "__main__":

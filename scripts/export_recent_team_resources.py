@@ -31,6 +31,15 @@ import urllib.request
 from collections import defaultdict
 from typing import Any, Optional
 
+from standard_library_pdf import (
+    CONTENT_WIDTH as PDF_CONTENT_WIDTH,
+    MARGIN as PDF_MARGIN,
+    StandardLibraryPdf,
+    page_heading as pdf_page_heading,
+    table as pdf_table,
+    wrapped_lines as pdf_wrapped_lines,
+)
+
 
 CONTROLLER = "/api/controller/v2"
 GATEWAY = "/api/gateway/v1"
@@ -580,6 +589,157 @@ def render_markdown(report: list[dict[str, Any]], days: int, cutoff: str) -> str
     return "\n".join(lines)
 
 
+PDF_REPORT_TITLE = "AAP Job Template Access Report"
+
+
+def pdf_add_wrapped(
+    document: StandardLibraryPdf,
+    value: Any,
+    width: float = PDF_CONTENT_WIDTH,
+    size: float = 9,
+    bold: bool = False,
+    indent: float = 0,
+) -> None:
+    for line in pdf_wrapped_lines(value, width - indent, size):
+        document.text(PDF_MARGIN + indent, document.y, line, size, bold)
+        document.y -= size + 3
+
+
+def pdf_ensure_space(
+    document: StandardLibraryPdf,
+    height: float,
+    continuation: str,
+) -> None:
+    if document.y - height < 34:
+        document.new_page()
+        pdf_page_heading(document, PDF_REPORT_TITLE, continuation)
+
+
+def render_pdf(report: list[dict[str, Any]], days: int, cutoff: str) -> bytes:
+    """Render the recently-used access report with no third-party packages."""
+    organizations = {item["owning_organization"] for item in report}
+    teams = {
+        (access["team_organization"], access["team"])
+        for item in report
+        for access in item["access"]
+    }
+    without_access = sum(not item["access"] for item in report)
+    prompted_templates = sum(
+        any(prompt["enabled"] for prompt in item["launch_prompts"].values())
+        for item in report
+    )
+    cross_organization = sum(
+        access["team_organization"] != item["owning_organization"]
+        for item in report
+        for access in item["access"]
+    )
+    readiness_attention = sum(
+        access["launch_readiness"]["status"] == "attention"
+        for item in report
+        for access in item["access"]
+    )
+
+    document = StandardLibraryPdf()
+    pdf_page_heading(document, PDF_REPORT_TITLE)
+    pdf_add_wrapped(
+        document,
+        f"Current team access to Job Templates with a last run in the past "
+        f"{days} days. Cutoff: {cutoff}",
+    )
+    document.y -= 6
+
+    pdf_table(
+        document,
+        PDF_REPORT_TITLE,
+        "Summary",
+        ["Metric", "Count"],
+        [
+            ["Recently used Job Templates", len(report)],
+            ["Owning organizations", len(organizations)],
+            ["Teams with access", len(teams)],
+            ["Templates with no team access", without_access],
+            ["Templates with launch prompts", prompted_templates],
+            ["Cross-organization team grants", cross_organization],
+            ["Team readiness entries needing review", readiness_attention],
+        ],
+        [600, 120],
+    )
+
+    template_rows = [
+        [
+            resource["owning_organization"],
+            resource["name"],
+            resource.get("last_job_run", "Unknown"),
+            resource.get("project", {}).get("name", "-"),
+            resource.get("inventory", {}).get("name", "-"),
+            len(resource["access"]),
+        ]
+        for resource in report
+    ]
+    pdf_table(
+        document,
+        PDF_REPORT_TITLE,
+        "Templates",
+        ["Organization", "Job Template", "Last run", "Project", "Inventory", "Teams"],
+        template_rows,
+        [105, 205, 105, 115, 120, 70],
+    )
+
+    for resource in report:
+        pdf_ensure_space(document, 150, "Details - continued")
+        pdf_add_wrapped(
+            document,
+            f"{resource['owning_organization']} - {resource['name']}",
+            size=12,
+            bold=True,
+        )
+        document.y -= 2
+        detail_lines = [
+            f"Last run: {resource.get('last_job_run', 'Unknown')}",
+            f"API: {resource['api_url']}",
+        ]
+        if resource.get("playbook"):
+            detail_lines.append(f"Playbook: {resource['playbook']}")
+        if resource.get("project"):
+            detail_lines.append(f"Project: {resource['project']['name']}")
+        if resource.get("inventory"):
+            detail_lines.append(f"Inventory: {resource['inventory']['name']}")
+        credentials = resource.get("credentials", [])
+        detail_lines.append(
+            "Credentials: " + ", ".join(item["name"] for item in credentials)
+            if credentials
+            else "Credentials: none configured"
+        )
+        for detail in detail_lines:
+            pdf_add_wrapped(document, detail, size=8.5, indent=6)
+        document.y -= 3
+
+        access_rows = []
+        for access in resource["access"]:
+            readiness = access["launch_readiness"]
+            access_rows.append(
+                [
+                    access["team_organization"],
+                    access["team"],
+                    access["level"],
+                    ", ".join(source.replace("_", " ") for source in access["sources"]),
+                    (
+                        f"{readiness['status']}; inventory: {readiness['inventory']}; "
+                        f"credentials: {readiness['credentials']}"
+                    ),
+                ]
+            )
+        pdf_table(
+            document,
+            PDF_REPORT_TITLE,
+            "Team access",
+            ["Team organization", "Team", "Level", "Grant path", "Launch readiness"],
+            access_rows,
+            [120, 150, 65, 165, 220],
+        )
+    return document.finish()
+
+
 def effective_access_level(permissions: set[str]) -> Optional[str]:
     if permissions & {
         "awx.change_jobtemplate",
@@ -916,6 +1076,10 @@ def main() -> int:
         "--markdown-output",
         help="optional human-readable Markdown report path",
     )
+    parser.add_argument(
+        "--pdf-output",
+        help="optional dependency-free PDF report path",
+    )
     args = parser.parse_args()
     if args.days < 1:
         parser.error("--days must be at least 1")
@@ -932,6 +1096,10 @@ def main() -> int:
             with open(args.markdown_output, "w", encoding="utf-8") as target:
                 target.write(render_markdown(report, args.days, cutoff))
             print(f"Wrote {args.markdown_output} (cutoff {cutoff})", file=sys.stderr)
+        if args.pdf_output:
+            with open(args.pdf_output, "wb") as target:
+                target.write(render_pdf(report, args.days, cutoff))
+            print(f"Wrote {args.pdf_output} (cutoff {cutoff})", file=sys.stderr)
     except (ExportError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

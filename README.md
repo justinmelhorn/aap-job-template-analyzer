@@ -1,10 +1,9 @@
 # AAP Job Template Access Report
 
-This read-only Python utility exports one YAML record for every Ansible
-Automation Platform Job Template run during a selected period. Each record
-contains the template's related resources and the teams that can currently
-access it. When a template prompts for inventory or credentials at launch, the
-report also provides a conservative team-derived readiness assessment.
+These read-only Python utilities provide two views of Ansible Automation
+Platform Job Templates: a recent-use resource/readiness report and a complete
+Gateway-plus-Controller identity-access audit. Both produce YAML and a
+dependency-free PDF, and neither changes AAP data.
 
 ## Requirements
 
@@ -53,9 +52,10 @@ Do not disable certificate validation in production.
 
 ### Interactive setup
 
-The easiest option is the guided shell wrapper. It first offers two reports,
-then prompts for the connection, authentication, certificate validation, and
-relevant output settings, so you do not need to export environment variables:
+The easiest option is the guided shell wrapper. It lets you run either report
+or both, then prompts for the connection, authentication, certificate
+validation, and relevant output settings, so you do not need to export
+environment variables:
 
 ```bash
 ./run-report.sh
@@ -64,44 +64,60 @@ relevant output settings, so you do not need to export environment variables:
 Password and token input is hidden and is used only by the analyzer process;
 the wrapper does not write credentials to disk.
 
-Choose report 1 for the existing recently-used template analysis. Choose
-report 2 for the AAP 2.5 Controller team-role report described below. Choose
-report 3 to run both sequentially with the same connection and authentication,
-producing the YAML, Markdown, and PDF outputs in one run.
+While a report is running, the wrapper prints its current report name and an
+elapsed-time heartbeat every 15 seconds, followed by an explicit finished or
+failed status. Set `AAP_STATUS_INTERVAL` to a positive number of seconds to
+change the heartbeat interval.
 
-### AAP 2.5 team → role → Job Template report
+Choose report 1 for the recently-used template analysis. Choose report 2 for
+the complete Job Template identity-access audit described below. Choose report
+3 to run both sequentially with one connection and authentication session,
+producing two YAML files and two PDF reports.
 
-AAP 2.5 gives a team a UUID in Platform Gateway while Controller retains the
-team's older integer ID for Job Template permissions. The dedicated report
-handles that split automatically:
+### AAP 2.4 → 2.5 Job Template identity-access audit
 
-- It scans teams from `/api/controller/v2/teams/`.
-- It follows each Controller team's `roles` relationship using the integer
-  Controller ID.
-- It retains only roles whose resource is a Job Template.
-- It matches the same team in Gateway by organization name and team name, with
-  a unique-name fallback, and records the Gateway UUID for traceability.
-- It never passes a Controller integer ID to Gateway or a Gateway UUID to
-  Controller.
+AAP 2.5 separates platform identities and platform roles in Gateway from
+Controller-owned automation resources and permissions. The identity audit
+reads both API surfaces and correlates the evidence into effective Job
+Template access:
+
+- It audits organizations, teams, users, role definitions, team role
+  assignments, and user role assignments under both `/api/gateway/v1/` and
+  `/api/controller/v2/`.
+- It scans every Controller Job Template; the recent-run filter does not apply.
+- It always follows advertised legacy `related.roles` links for users and
+  teams, preserving evidence that may not have migrated cleanly from 2.4.
+- It records direct team and user grants plus organization-inherited grants
+  that confer access to an owning organization's Job Templates.
+- It collects team membership independently from Gateway and Controller,
+  derives it from Team Member/Admin assignments when needed, and reports
+  disagreement as membership drift.
+- It summarizes platform and Controller administrators and auditors separately
+  instead of expanding global access onto every template.
+- It correlates identities with `ansible_id` first, then username for users and
+  organization/name for teams. Ambiguous matches remain separate and appear in
+  diagnostics.
 
 Run it from the interactive wrapper by selecting option 2, or directly after
 setting the connection environment variables:
 
 ```bash
-python3 scripts/export_team_job_template_roles.py \
-  --output team-job-template-roles.pdf
+python3 scripts/export_job_template_identity_access.py \
+  --yaml-output job-template-identity-access.yaml \
+  --pdf-output job-template-identity-access.pdf
 ```
 
-The PDF is generated directly with Python's standard library; it does not use
-ReportLab, PyPDF, or another installed package. It contains a clean
-`Organization → Team → Role → Job Template` table and a separate
-Controller-ID-to-Gateway-UUID mapping table, with automatic text wrapping,
-repeated table headers, pagination, and page numbers.
-If Gateway team listing is unavailable, Controller permissions are still
-reported because Controller is the source of truth for these assignments.
-Only direct Job Template role records are included; roles attached to
-inventories, credentials, projects, workflows, or other resource types are
-filtered out.
+`scripts/export_team_job_template_roles.py` remains as a compatibility launcher
+and accepts the same arguments. Both output formats use only Python's standard
+library. The YAML contains endpoint coverage, per-template team and direct-user
+grants, global access, membership drift, unresolved identities, and collection
+errors. The PDF presents the same audit in coverage, template, and diagnostic
+sections with wrapping, repeated headers, pagination, and page numbers.
+
+The report never emits a Gateway-to-Controller ID mapping table, raw UUID
+comparison table, email address, authentication identifier, or credential
+data. If a required endpoint cannot be read, both artifacts are still written
+and visibly marked partial; the command then exits with status 2.
 
 ### Environment-variable setup
 
@@ -112,15 +128,15 @@ above and run from the repository root:
 python3 scripts/export_recent_team_resources.py \
   --days 365 \
   --output team-resources.yaml \
-  --markdown-output team-resources.md
+  --pdf-output team-resources.pdf
 ```
 
-The YAML is the machine-readable source. The optional Markdown companion adds
-a summary, a compact template table, friendly `([view in AAP](...))` UI links,
-and detailed team-access tables for easy review in GitHub or any Markdown
-viewer. YAML continues to expose stable API URLs for automation.
+The YAML is the machine-readable source. The PDF companion adds a summary, a
+compact template table, and detailed team-access tables with automatic text
+wrapping, repeated table headers, and pagination. YAML continues to expose
+stable API and UI URLs for automation.
 
-Omit `--output` to write YAML to standard output. Omit `--markdown-output` if
+Omit `--output` to write YAML to standard output. Omit `--pdf-output` if
 you only need YAML. `--days` must be at least 1 and defaults to 365.
 
 The command only sends HTTP `GET` requests. It does not launch jobs, modify
@@ -177,40 +193,13 @@ job_templates:
           credentials: "default_prompt"
 ```
 
-### Markdown summary
+### PDF report
 
-```markdown
-# AAP Job Template Access Report
-
-## Summary
-
-| Metric | Count |
-| --- | ---: |
-| Recently used Job Templates | 1 |
-| Owning organizations | 1 |
-| Teams with access | 4 |
-| Templates with no team access | 0 |
-| Templates with launch prompts | 1 |
-| Required selections without defaults | 1 |
-| Cross-organization team grants | 1 |
-| Team readiness entries needing review | 1 |
-
-## Templates
-
-| Organization | Job Template | Last run | Project | Inventory | Teams |
-| --- | --- | --- | --- | --- | ---: |
-| Payments | Payments \| Deploy Development ([view in AAP](https://aap.example.com/execution/templates/job-template/24/details)) | 2026-08-12T15:20:12Z | Payments Automation ([view in AAP](https://aap.example.com/execution/projects/8/details)) | Payments Development ([view in AAP](https://aap.example.com/execution/inventories/inventory/2/details)) | 4 |
-```
-
-The Markdown summary also counts effective admin, execute, and view grants.
-Each detailed section lists credentials and groups teams by their home
-organization. Each group is marked as either the same as the template owner or
-cross-organization access. The table shows effective access, grant path, and
-launch readiness. Templates without team access are called out for attention.
-
-Markdown links target the unified Platform Gateway UI under `/execution/`, not
-the JSON API. Configure `AAP_URL` with the Gateway URL so these links open the
-correct AAP 2.5-2.7 interface.
+The PDF begins with summary counts and a compact recently-used template table.
+Each detailed section lists the template metadata, credentials, effective team
+access, grant path, and launch readiness. Templates without team access are
+called out with an empty access table. The PDF is generated using only Python's
+standard library; no PDF package is required.
 
 Access levels are reduced to `view`, `execute`, or `admin`. `can_execute` is
 retained separately: a custom change-only role can display as `admin` without
@@ -266,12 +255,13 @@ for later supported versions.
 
 ## Git and security
 
-`lab.env`, `team-resources.yaml`, `team-resources.md`, and
-`team-job-template-roles.pdf` are excluded by the repository's `.gitignore`.
-Never commit AAP passwords or tokens. Although the reports contain no
-credential secrets, they do contain organization, team, inventory, project,
-credential, and template names; review that operational metadata before
-publishing a generated report.
+`lab.env`, `team-resources.yaml`, `team-resources.md`, `team-resources.pdf`,
+`job-template-identity-access.yaml`, `job-template-identity-access.pdf`, and
+the legacy `team-job-template-roles.pdf` name are excluded by the repository's
+`.gitignore`. Never commit AAP passwords or tokens. Although the reports contain
+no credential secrets or email addresses, they do contain usernames plus
+organization, team, inventory, project, credential, and template names; review
+that operational metadata before publishing a generated report.
 
 ## Troubleshooting
 
@@ -280,7 +270,8 @@ publishing a generated report.
   method. A token takes precedence when both methods are set.
 - Certificate verification errors: install the correct CA certificate. Use
   `AAP_VALIDATE_CERTS=false` only for an isolated lab.
-- HTTP 401 or 403: the account is invalid or cannot read the required AAP
-  Controller and RBAC endpoints.
+- HTTP 401 or 403: the account is invalid or cannot read one or more required
+  Gateway, Controller, or RBAC endpoints. The identity audit writes partial
+  artifacts with endpoint-specific errors and exits nonzero.
 - An empty `job_templates` list means no template has a `last_job_run` inside
-  the selected period.
+  the selected period in report 1. Report 2 audits every Job Template.
