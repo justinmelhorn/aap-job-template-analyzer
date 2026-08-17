@@ -12,6 +12,9 @@ report also provides a conservative team-derived readiness assessment.
 - Network access to the AAP Platform Gateway
 - An AAP account allowed to read Controller resources and RBAC assignments
 
+The interactive shell wrapper checks `python3`, `python`, and `py` in that
+order and uses the first launcher that reports Python 3.9 or newer.
+
 There are no third-party Python dependencies. The script uses only modules
 included with Python, so no virtual environment or `pip install` is required.
 It does not require Ansible, PyYAML, requests, or a container runtime.
@@ -50,17 +53,55 @@ Do not disable certificate validation in production.
 
 ### Interactive setup
 
-The easiest option is the guided shell wrapper. It prompts for the connection,
-authentication, certificate validation, reporting period, and output files, so
-you do not need to export environment variables:
+The easiest option is the guided shell wrapper. It first offers two reports,
+then prompts for the connection, authentication, certificate validation, and
+relevant output settings, so you do not need to export environment variables:
 
 ```bash
 ./run-report.sh
 ```
 
 Password and token input is hidden and is used only by the analyzer process;
-the wrapper does not write credentials to disk. It creates both the YAML and
-Markdown reports by default.
+the wrapper does not write credentials to disk.
+
+Choose report 1 for the existing recently-used template analysis. Choose
+report 2 for the AAP 2.5 Controller team-role report described below. Choose
+report 3 to run both sequentially with the same connection and authentication,
+producing the YAML, Markdown, and PDF outputs in one run.
+
+### AAP 2.5 team → role → Job Template report
+
+AAP 2.5 gives a team a UUID in Platform Gateway while Controller retains the
+team's older integer ID for Job Template permissions. The dedicated report
+handles that split automatically:
+
+- It scans teams from `/api/controller/v2/teams/`.
+- It follows each Controller team's `roles` relationship using the integer
+  Controller ID.
+- It retains only roles whose resource is a Job Template.
+- It matches the same team in Gateway by organization name and team name, with
+  a unique-name fallback, and records the Gateway UUID for traceability.
+- It never passes a Controller integer ID to Gateway or a Gateway UUID to
+  Controller.
+
+Run it from the interactive wrapper by selecting option 2, or directly after
+setting the connection environment variables:
+
+```bash
+python3 scripts/export_team_job_template_roles.py \
+  --output team-job-template-roles.pdf
+```
+
+The PDF is generated directly with Python's standard library; it does not use
+ReportLab, PyPDF, or another installed package. It contains a clean
+`Organization → Team → Role → Job Template` table and a separate
+Controller-ID-to-Gateway-UUID mapping table, with automatic text wrapping,
+repeated table headers, pagination, and page numbers.
+If Gateway team listing is unavailable, Controller permissions are still
+reported because Controller is the source of truth for these assignments.
+Only direct Job Template role records are included; roles attached to
+inventories, credentials, projects, workflows, or other resource types are
+filtered out.
 
 ### Environment-variable setup
 
@@ -225,11 +266,12 @@ for later supported versions.
 
 ## Git and security
 
-`lab.env`, `team-resources.yaml`, and `team-resources.md` are excluded by the
-repository's `.gitignore`. Never commit AAP passwords or tokens. Although the
-reports contain no credential secrets, they do contain organization, team,
-inventory, project, credential, and template names; review that operational
-metadata before publishing a generated report.
+`lab.env`, `team-resources.yaml`, `team-resources.md`, and
+`team-job-template-roles.pdf` are excluded by the repository's `.gitignore`.
+Never commit AAP passwords or tokens. Although the reports contain no
+credential secrets, they do contain organization, team, inventory, project,
+credential, and template names; review that operational metadata before
+publishing a generated report.
 
 ## Troubleshooting
 

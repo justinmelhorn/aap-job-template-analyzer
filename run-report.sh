@@ -2,20 +2,45 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-ANALYZER="${SCRIPT_DIR}/scripts/export_recent_team_resources.py"
+RECENT_ANALYZER="${SCRIPT_DIR}/scripts/export_recent_team_resources.py"
+TEAM_ROLE_ANALYZER="${SCRIPT_DIR}/scripts/export_team_job_template_roles.py"
 
-if ! command -v python3 >/dev/null 2>&1; then
-  printf 'ERROR: python3 was not found in PATH. Python 3.9 or newer is required.\n' >&2
+python_launcher=""
+for candidate in python3 python py; do
+  if command -v "${candidate}" >/dev/null 2>&1 && \
+    "${candidate}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' \
+      >/dev/null 2>&1; then
+    python_launcher="${candidate}"
+    break
+  fi
+done
+
+if [[ -z "${python_launcher}" ]]; then
+  printf 'ERROR: no supported Python launcher was found. Tried python3, python, and py; Python 3.9 or newer is required.\n' >&2
   exit 1
 fi
 
-if [[ ! -f "${ANALYZER}" ]]; then
-  printf 'ERROR: analyzer not found at %s\n' "${ANALYZER}" >&2
+if [[ ! -f "${RECENT_ANALYZER}" || ! -f "${TEAM_ROLE_ANALYZER}" ]]; then
+  printf 'ERROR: one or more report scripts are missing from %s/scripts\n' "${SCRIPT_DIR}" >&2
   exit 1
 fi
 
-printf 'AAP Job Template Access Report\n'
+printf 'AAP Job Template Reports\n'
 printf 'Credentials are used only for this run and are not written to disk.\n\n'
+
+printf '  1) Recently used Job Templates with effective team access\n'
+printf '  2) All Controller team roles assigned directly to Job Templates (AAP 2.5 ID-safe)\n'
+printf '  3) Run both reports\n'
+read -r -p 'Choose a report [1/2/3] (1): ' report_type
+case "${report_type:-1}" in
+  1) report_type="recent" ;;
+  2) report_type="team_roles" ;;
+  3) report_type="both" ;;
+  *)
+    printf 'ERROR: choose report 1, 2, or 3.\n' >&2
+    exit 2
+    ;;
+esac
 
 aap_url=""
 while [[ -z "${aap_url}" ]]; do
@@ -61,25 +86,48 @@ case "${validate_answer:-y}" in
     ;;
 esac
 
-read -r -p 'Number of days to report (365): ' days
-days="${days:-365}"
-if [[ ! "${days}" =~ ^[1-9][0-9]*$ ]]; then
-  printf 'ERROR: days must be a positive whole number.\n' >&2
-  exit 2
-fi
+days=""
+yaml_output=""
+markdown_output=""
+pdf_output=""
+if [[ "${report_type}" == "recent" || "${report_type}" == "both" ]]; then
+  read -r -p 'Number of days to report (365): ' days
+  days="${days:-365}"
+  if [[ ! "${days}" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'ERROR: days must be a positive whole number.\n' >&2
+    exit 2
+  fi
 
-read -r -p 'YAML output file (team-resources.yaml): ' yaml_output
-yaml_output="${yaml_output:-team-resources.yaml}"
-read -r -p 'Markdown output file (team-resources.md): ' markdown_output
-markdown_output="${markdown_output:-team-resources.md}"
+  read -r -p 'YAML output file (team-resources.yaml): ' yaml_output
+  yaml_output="${yaml_output:-team-resources.yaml}"
+  read -r -p 'Markdown output file (team-resources.md): ' markdown_output
+  markdown_output="${markdown_output:-team-resources.md}"
+fi
+if [[ "${report_type}" == "team_roles" || "${report_type}" == "both" ]]; then
+  read -r -p 'PDF output file (team-job-template-roles.pdf): ' pdf_output
+  pdf_output="${pdf_output:-team-job-template-roles.pdf}"
+fi
 
 printf '\nReady to run:\n'
 printf '  Gateway: %s\n' "${aap_url}"
 printf '  Authentication: %s\n' "${auth_method}"
 printf '  Validate certificate: %s\n' "${validate_certs}"
-printf '  Period: %s days\n' "${days}"
-printf '  YAML: %s\n' "${yaml_output}"
-printf '  Markdown: %s\n' "${markdown_output}"
+printf '  Python launcher: %s\n' "${python_launcher}"
+if [[ "${report_type}" == "recent" ]]; then
+  printf '  Report: Recently used Job Templates with effective team access\n'
+elif [[ "${report_type}" == "team_roles" ]]; then
+  printf '  Report: All direct team-to-Job-Template Controller roles\n'
+else
+  printf '  Report: Both reports\n'
+fi
+if [[ "${report_type}" == "recent" || "${report_type}" == "both" ]]; then
+  printf '  Period: %s days\n' "${days}"
+  printf '  YAML: %s\n' "${yaml_output}"
+  printf '  Markdown: %s\n' "${markdown_output}"
+fi
+if [[ "${report_type}" == "team_roles" || "${report_type}" == "both" ]]; then
+  printf '  PDF: %s\n' "${pdf_output}"
+fi
 read -r -p 'Continue? [Y/n]: ' continue_answer
 case "${continue_answer:-y}" in
   y|Y|yes|YES|Yes) ;;
@@ -100,10 +148,15 @@ esac
     export AAP_PASSWORD="${password}"
     unset AAP_TOKEN
   fi
-  python3 "${ANALYZER}" \
-    --days "${days}" \
-    --output "${yaml_output}" \
-    --markdown-output "${markdown_output}"
+  if [[ "${report_type}" == "recent" || "${report_type}" == "both" ]]; then
+    "${python_launcher}" "${RECENT_ANALYZER}" \
+      --days "${days}" \
+      --output "${yaml_output}" \
+      --markdown-output "${markdown_output}"
+  fi
+  if [[ "${report_type}" == "team_roles" || "${report_type}" == "both" ]]; then
+    "${python_launcher}" "${TEAM_ROLE_ANALYZER}" --output "${pdf_output}"
+  fi
 )
 
 password=""
