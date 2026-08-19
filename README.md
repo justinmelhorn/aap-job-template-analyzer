@@ -13,7 +13,9 @@ credential inputs or changes AAP.
 
 ## Setup
 
-Python 3.9 or newer is required. Set the Platform Gateway URL and either a token:
+Python 3.9 or newer is required. The shell wrapper checks aliases first and then
+executables named `python3`, `python`, and `py`, using the first supported
+launcher it finds. Set the Platform Gateway URL and either a token:
 
 ```bash
 export AAP_URL=https://aap.example.com

@@ -24,7 +24,48 @@ if [[ -n "${env_file}" ]]; then
   printf 'Loaded settings from %s\n' "${env_file}"
 fi
 
+python_launcher=()
+python_label=""
+version_check='import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)'
+
+# Prefer a simple alias defined by the loaded environment file or current shell.
+for candidate in python3 python py; do
+  alias_definition="$(alias "${candidate}" 2>/dev/null || true)"
+  if [[ -z "${alias_definition}" ]]; then
+    continue
+  fi
+  alias_command="${alias_definition#*=}"
+  alias_command="${alias_command#\'}"
+  alias_command="${alias_command%\'}"
+  read -r -a alias_parts <<< "${alias_command}"
+  if [[ ${#alias_parts[@]} -gt 0 ]] && \
+      "${alias_parts[@]}" -c "${version_check}" >/dev/null 2>&1; then
+    python_launcher=("${alias_parts[@]}")
+    python_label="${candidate} alias (${alias_command})"
+    break
+  fi
+done
+
+# If no usable alias exists, use the first supported executable on PATH.
+if [[ ${#python_launcher[@]} -eq 0 ]]; then
+  for candidate in python3 python py; do
+    executable="$(type -P "${candidate}" 2>/dev/null || true)"
+    if [[ -n "${executable}" ]] && \
+        "${executable}" -c "${version_check}" >/dev/null 2>&1; then
+      python_launcher=("${executable}")
+      python_label="${candidate} (${executable})"
+      break
+    fi
+  done
+fi
+
+if [[ ${#python_launcher[@]} -eq 0 ]]; then
+  printf 'ERROR: Python 3.9 or newer was not found via python3, python, or py.\n' >&2
+  exit 1
+fi
+
 printf 'AAP Job Template Report\n\n'
+printf 'Python launcher: %s\n\n' "${python_label}"
 if [[ -z "${AAP_URL:-}" ]]; then
   read -r -p 'AAP Platform Gateway URL: ' AAP_URL
 fi
@@ -92,7 +133,7 @@ case "${check_rbac}" in
   *) printf 'ERROR: AAP_CHECK_RBAC must be yes or no.\n' >&2; exit 2 ;;
 esac
 
-python3 "${SCRIPT}" \
+"${python_launcher[@]}" "${SCRIPT}" \
   "${mode_argument[@]}" \
   "${rbac_argument[@]}" \
   --days "${days}" \
