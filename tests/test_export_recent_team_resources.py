@@ -136,14 +136,33 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(["Never Run", "Old Audit"], [item["name"] for item in report])
         self.assertIsNone(report[0]["last_run"])
 
+    def test_no_rbac_skips_permission_calls_and_marks_output(self):
+        client = FakeClient()
+        report, _ = MODULE.build_report(client, 365, "unused", check_rbac=False)
+        self.assertFalse(report[0]["permissions_checked"])
+        self.assertNotIn("permissions", report[0])
+
+        output = MODULE.render_yaml(report)
+        self.assertIn("    permissions_checked: false", output)
+        self.assertNotIn("\n    permissions:", output)
+
+        pdf = MODULE.render_pdf(
+            report, 365, "2025-08-19T00:00:00Z", "unused", rbac_checked=False
+        )
+        self.assertIn(b"Overview", pdf)
+        self.assertIn(b"Permissions: not checked", pdf)
+
     def test_all_has_no_date_filter(self):
         report, _ = MODULE.build_report(FakeClient(), 365, "all")
         self.assertEqual(3, len(report))
 
     def test_empty_yaml_and_pdf(self):
         self.assertEqual("summary: []\njob_templates: []\n", MODULE.render_yaml([]))
-        pdf = MODULE.render_pdf([], 365, "2025-08-19T00:00:00Z", "unused")
+        pdf = MODULE.render_pdf(
+            [], 365, "2025-08-19T00:00:00Z", "unused", rbac_checked=True
+        )
         self.assertTrue(pdf.startswith(b"%PDF-1.4"))
+        self.assertIn(b"Overview", pdf)
         self.assertIn(b"Summary", pdf)
 
 

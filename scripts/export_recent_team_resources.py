@@ -141,8 +141,48 @@ def selected(template: dict[str, Any], cutoff: str, mode: str) -> bool:
     return bool(last_run and str(last_run) >= cutoff)
 
 
+def job_entries(
+    client: Client,
+    templates: list[dict[str, Any]],
+    access: Optional[dict[str, dict[tuple[str, str], dict[str, str]]]] = None,
+) -> list[dict[str, Any]]:
+    report = []
+    for template in templates:
+        summary = template.get("summary_fields", {})
+        inventory = resource(client, "inventory", summary.get("inventory"))
+        credentials = []
+        for item in summary.get("credentials", []):
+            credential = resource(client, "credential", item)
+            if credential:
+                credentials.append(credential)
+        entry: dict[str, Any] = {
+            "name": str(template["name"]),
+            "url": ui_url(client, "job_template", template),
+            "last_run": (
+                str(template["last_job_run"])
+                if template.get("last_job_run")
+                else None
+            ),
+            "inventory": inventory,
+            "credentials": sorted(
+                credentials, key=lambda item: item["name"].casefold()
+            ),
+            "permissions_checked": access is not None,
+        }
+        if access is not None:
+            entry["permissions"] = sorted(
+                access[key(template["id"])].values(),
+                key=lambda item: (item["type"], item["name"].casefold()),
+            )
+        report.append(entry)
+    return sorted(report, key=lambda item: item["name"].casefold())
+
+
 def build_report(
-    client: Client, days: int = 365, mode: str = "recent"
+    client: Client,
+    days: int = 365,
+    mode: str = "recent",
+    check_rbac: bool = True,
 ) -> tuple[list[dict[str, Any]], str]:
     cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat(
         timespec="seconds"
@@ -152,6 +192,9 @@ def build_report(
         for item in client.list(f"{CONTROLLER}/job_templates/", order_by="name")
         if selected(item, cutoff, mode)
     ]
+    if not check_rbac:
+        return job_entries(client, templates), cutoff
+
     templates_by_id = {key(item["id"]): item for item in templates}
     templates_by_ansible_id = {
         key(
@@ -261,35 +304,7 @@ def build_report(
                 for template in templates_by_org.get(str(organization_name), []):
                     add(template, principal_type, principal_id, level)
 
-    report = []
-    for template in templates:
-        summary = template.get("summary_fields", {})
-        inventory = resource(client, "inventory", summary.get("inventory"))
-        credentials = []
-        for item in summary.get("credentials", []):
-            credential = resource(client, "credential", item)
-            if credential:
-                credentials.append(credential)
-        report.append(
-            {
-                "name": str(template["name"]),
-                "url": ui_url(client, "job_template", template),
-                "last_run": (
-                    str(template["last_job_run"])
-                    if template.get("last_job_run")
-                    else None
-                ),
-                "inventory": inventory,
-                "credentials": sorted(
-                    credentials, key=lambda item: item["name"].casefold()
-                ),
-                "permissions": sorted(
-                    access[key(template["id"])].values(),
-                    key=lambda item: (item["type"], item["name"].casefold()),
-                ),
-            }
-        )
-    return sorted(report, key=lambda item: item["name"].casefold()), cutoff
+    return job_entries(client, templates, access), cutoff
 
 
 def scalar(value: Optional[str]) -> str:
@@ -330,6 +345,9 @@ def render_yaml(report: list[dict[str, Any]]) -> str:
                     f"        url: {scalar(credential['url'])}",
                 ]
             )
+        if not job["permissions_checked"]:
+            lines.append("    permissions_checked: false")
+            continue
         lines.append("    permissions:" + ("" if job["permissions"] else " []"))
         for permission in job["permissions"]:
             lines.extend(
@@ -356,17 +374,35 @@ def add_text(document: StandardLibraryPdf, value: str, bold: bool = False) -> No
 
 
 def render_pdf(
-    report: list[dict[str, Any]], days: int, cutoff: str, mode: str
+    report: list[dict[str, Any]],
+    days: int,
+    cutoff: str,
+    mode: str,
+    rbac_checked: bool,
 ) -> bytes:
     document = StandardLibraryPdf()
     page_heading(document, TITLE)
-    description = {
+    scope = {
         "recent": f"Run within the last {days} days",
-        "unused": f"Not run within the last {days} days (never-run jobs included)",
-        "all": "All Job Templates",
+        "unused": f"Not run within the last {days} days; never-run jobs included",
+        "all": "All Job Templates; no date filter",
     }[mode]
-    add_text(document, f"{description}. Cutoff: {cutoff}")
-    document.y -= 6
+    overview = [
+        ["Scope", scope],
+        ["Cutoff", cutoff if mode != "all" else "Not applied"],
+        ["Job Templates", len(report)],
+        ["Attached inventories", sum(job["inventory"] is not None for job in report)],
+        ["Attached credentials", sum(len(job["credentials"]) for job in report)],
+        ["RBAC permissions", "Checked" if rbac_checked else "Not checked"],
+    ]
+    table(
+        document,
+        TITLE,
+        "Overview",
+        ["Item", "Value"],
+        overview,
+        [250, 470],
+    )
     table(
         document,
         TITLE,
@@ -398,6 +434,10 @@ def render_pdf(
             else "Credentials: "
             + "; ".join(f"{item['name']} - {item['url']}" for item in credentials),
         )
+        if not job["permissions_checked"]:
+            add_text(document, "Permissions: not checked")
+            document.y -= 12
+            continue
         permission_rows = []
         for permission in job["permissions"]:
             name = permission["name"]
@@ -423,6 +463,7 @@ def main() -> int:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--unused", action="store_true", help="not run within --days")
     mode.add_argument("--all", action="store_true", help="no date filter")
+    parser.add_argument("--no-rbac", action="store_true", help="skip permission checks")
     parser.add_argument("--output", default="-", help="YAML path; default: stdout")
     parser.add_argument("--pdf-output", help="optional PDF path")
     args = parser.parse_args()
@@ -430,7 +471,9 @@ def main() -> int:
         parser.error("--days must be at least 1")
     report_mode = "all" if args.all else "unused" if args.unused else "recent"
     try:
-        report, cutoff = build_report(Client(), args.days, report_mode)
+        report, cutoff = build_report(
+            Client(), args.days, report_mode, check_rbac=not args.no_rbac
+        )
         output = render_yaml(report)
         if args.output == "-":
             sys.stdout.write(output)
@@ -440,7 +483,15 @@ def main() -> int:
             print(f"Wrote {args.output}", file=sys.stderr)
         if args.pdf_output:
             with open(args.pdf_output, "wb") as target:
-                target.write(render_pdf(report, args.days, cutoff, report_mode))
+                target.write(
+                    render_pdf(
+                        report,
+                        args.days,
+                        cutoff,
+                        report_mode,
+                        rbac_checked=not args.no_rbac,
+                    )
+                )
             print(f"Wrote {args.pdf_output}", file=sys.stderr)
     except (ExportError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

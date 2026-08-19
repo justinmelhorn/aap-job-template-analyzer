@@ -7,7 +7,8 @@ A small, read-only Python script that reports:
 - teams and users with current view, execute, or admin permission
 - recently used, unused, or all Job Templates
 
-It writes simple YAML and, optionally, a dependency-free PDF. It never exports
+It writes simple YAML and, optionally, a dependency-free PDF. The PDF starts
+with an overview and the consolidated name/URL summary. It never exports
 credential inputs or changes AAP.
 
 ## Setup
@@ -30,6 +31,28 @@ export AAP_PASSWORD='your-password'
 TLS certificates are validated by default. For an isolated lab with a self-signed
 certificate, set `AAP_VALIDATE_CERTS=false`.
 
+### Environment file
+
+`./run-report.sh` automatically loads `.env`, or `lab.env` when `.env` is not
+present. Authentication prompts are skipped when the file contains a complete
+token or username/password configuration.
+
+```bash
+AAP_URL=https://aap.example.com
+AAP_TOKEN='your-token'
+AAP_VALIDATE_CERTS=true
+
+# These five settings make the entire run non-interactive.
+AAP_REPORT_MODE=unused
+AAP_REPORT_DAYS=365
+AAP_CHECK_RBAC=false
+AAP_YAML_OUTPUT=unused-job-templates.yaml
+AAP_PDF_OUTPUT=unused-job-templates.pdf
+```
+
+Run `./run-report.sh` after saving the file. Set `AAP_ENV_FILE=/path/to/file`
+to load a different file. Environment files use normal shell assignment syntax.
+
 ## Run
 
 Job Templates run in the last year (the default):
@@ -45,13 +68,16 @@ Job Templates that have **not** run in the last year, including never-run jobs:
 ```bash
 python3 scripts/export_recent_team_resources.py \
   --unused \
+  --no-rbac \
   --output unused-job-templates.yaml \
   --pdf-output unused-job-templates.pdf
 ```
 
+Use `--no-rbac` to skip all permission API calls. The shell wrapper defaults to
+skipping RBAC for `unused` reports and checking it for `recent` or `all` reports.
 Use `--days 90` to change the cutoff or `--all` to remove the date filter.
 Omit `--output` to write YAML to stdout. The guided `./run-report.sh` wrapper
-prompts for the same settings.
+loads saved settings and prompts only for values that are missing.
 
 ## Output
 
