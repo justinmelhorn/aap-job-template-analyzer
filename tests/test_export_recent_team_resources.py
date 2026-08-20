@@ -104,13 +104,72 @@ class FakeClient:
         return data[path]
 
 
+class GatewayUserClient(FakeClient):
+    def __init__(self):
+        self.paths = []
+
+    def get(self, path, params=None):
+        if path.endswith("/config/"):
+            return {"version": "4.7.0"}
+        return super().get(path, params)
+
+    def list(self, path, **params):
+        self.paths.append(path)
+        gateway = {
+            "/api/gateway/v1/organizations/": [{"id": "g-org", "name": "Payments"}],
+            "/api/gateway/v1/teams/": [],
+            "/api/gateway/v1/users/": [
+                {
+                    "id": "g-alice",
+                    "ansible_id": "user-alice",
+                    "username": "alice",
+                }
+            ],
+            "/api/controller/v2/users/": [
+                {
+                    "id": 200,
+                    "ansible_id": "user-alice",
+                    "username": "alice-old-name",
+                },
+                {"id": 300, "username": "legacy-admin", "is_superuser": True},
+            ],
+            "/api/gateway/v1/role_definitions/": [
+                {"id": "execute", "permissions": ["awx.execute_jobtemplate"]}
+            ],
+            "/api/gateway/v1/role_team_assignments/": [],
+            "/api/gateway/v1/role_user_assignments/": [
+                {
+                    "user": "g-alice",
+                    "role_definition": "execute",
+                    "object_id": 10,
+                    "content_type": "awx.jobtemplate",
+                }
+            ],
+        }
+        if path in gateway:
+            return gateway[path]
+        return super().list(path, **params)
+
+
 class ExportTests(unittest.TestCase):
     def test_recent_report_has_resources_teams_users_and_summary(self):
         report, _ = MODULE.build_report(FakeClient(), 365, "recent")
         self.assertEqual(["Deploy"], [item["name"] for item in report])
         job = report[0]
+        self.assertEqual(
+            "https://aap.example.com/api/controller/v2/job_templates/10/",
+            job["url"],
+        )
         self.assertEqual("Production", job["inventory"]["name"])
+        self.assertEqual(
+            "https://aap.example.com/api/controller/v2/inventories/20/",
+            job["inventory"]["url"],
+        )
         self.assertEqual(["SSH Key"], [item["name"] for item in job["credentials"]])
+        self.assertEqual(
+            "https://aap.example.com/api/controller/v2/credentials/30/",
+            job["credentials"][0]["url"],
+        )
         self.assertEqual(
             [
                 {
@@ -127,9 +186,16 @@ class ExportTests(unittest.TestCase):
 
         output = MODULE.render_yaml(report)
         self.assertTrue(output.startswith("summary:\n  - name: \"Deploy\"\n    url:"))
+        self.assertIn('url: "https://aap.example.com/api/controller/v2/job_templates/10/"', output)
+        self.assertNotIn("\n    url: \"https://aap.example.com/execution/", output)
         self.assertIn("\njob_templates:\n", output)
         self.assertNotIn("must-not-appear", output)
         self.assertNotIn("inputs", output)
+
+        pdf = MODULE.render_pdf(
+            report, 365, "2025-08-19T00:00:00Z", "recent", rbac_checked=True
+        )
+        self.assertIn(b"/execution/templates/job-template/10/details", pdf)
 
     def test_unused_includes_old_and_never_run_jobs(self):
         report, _ = MODULE.build_report(FakeClient(), 365, "unused")
@@ -155,6 +221,26 @@ class ExportTests(unittest.TestCase):
     def test_all_has_no_date_filter(self):
         report, _ = MODULE.build_report(FakeClient(), 365, "all")
         self.assertEqual(3, len(report))
+
+    def test_overview_resource_counts_are_unique(self):
+        report, _ = MODULE.build_report(FakeClient(), 365, "recent")
+        duplicate = dict(report[0])
+        duplicate["name"] = "Another template using the same resources"
+        self.assertEqual((1, 1), MODULE.unique_resource_counts([report[0], duplicate]))
+
+    def test_gateway_users_are_cross_referenced_with_controller_users(self):
+        client = GatewayUserClient()
+        report, _ = MODULE.build_report(client, 365, "recent")
+        permissions = report[0]["permissions"]
+        self.assertEqual(1, client.paths.count("/api/gateway/v1/teams/"))
+        self.assertIn("/api/controller/v2/users/", client.paths)
+        self.assertEqual(
+            [
+                {"type": "user", "name": "alice", "level": "execute"},
+                {"type": "user", "name": "legacy-admin", "level": "admin"},
+            ],
+            permissions,
+        )
 
     def test_empty_yaml_and_pdf(self):
         self.assertEqual("summary: []\njob_templates: []\n", MODULE.render_yaml([]))

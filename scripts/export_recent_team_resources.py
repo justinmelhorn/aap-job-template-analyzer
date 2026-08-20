@@ -103,12 +103,25 @@ def ui_url(client: Client, kind: str, item: dict[str, Any]) -> str:
     return client.base_url + path
 
 
+def api_url(client: Client, kind: str, item: dict[str, Any]) -> str:
+    endpoint = {
+        "job_template": "job_templates",
+        "inventory": "inventories",
+        "credential": "credentials",
+    }[kind]
+    path = str(item.get("url") or f"{CONTROLLER}/{endpoint}/{item['id']}/")
+    if path.startswith(("http://", "https://")):
+        return path
+    return client.base_url + "/" + path.lstrip("/")
+
+
 def resource(client: Client, kind: str, item: Any) -> Optional[dict[str, str]]:
     if not isinstance(item, dict) or not item.get("id"):
         return None
     return {
         "name": str(item.get("name") or f"ID {item['id']}"),
-        "url": ui_url(client, kind, item),
+        "url": api_url(client, kind, item),
+        "ui_url": ui_url(client, kind, item),
     }
 
 
@@ -121,6 +134,38 @@ def permission_level(permissions: list[str]) -> Optional[str]:
     if "awx.view_jobtemplate" in values:
         return "view"
     return None
+
+
+def merge_users(
+    users_by_source: dict[str, list[dict[str, Any]]],
+) -> tuple[
+    dict[str, tuple[str, str]],
+    dict[tuple[str, str], str],
+    dict[str, list[dict[str, Any]]],
+]:
+    """Merge Gateway and Controller identities without comparing their IDs."""
+    stable_by_username: dict[str, set[str]] = defaultdict(set)
+    for users in users_by_source.values():
+        for user in users:
+            username = str(user.get("username") or "").casefold()
+            if username and user.get("ansible_id"):
+                stable_by_username[username].add(key(user["ansible_id"]))
+
+    principals: dict[str, tuple[str, str]] = {}
+    source_ids: dict[tuple[str, str], str] = {}
+    records: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for source, users in users_by_source.items():
+        for user in users:
+            username = str(user.get("username") or user.get("name") or user["id"])
+            normalized_username = username.casefold()
+            stable = key(user.get("ansible_id"))
+            if not stable and len(stable_by_username[normalized_username]) == 1:
+                stable = next(iter(stable_by_username[normalized_username]))
+            identity = f"ansible:{stable}" if stable else f"username:{normalized_username}"
+            principals.setdefault(identity, (username, ""))
+            source_ids[(source, key(user["id"]))] = identity
+            records[identity].append(user)
+    return principals, source_ids, records
 
 
 def rbac_base(client: Client) -> str:
@@ -157,7 +202,8 @@ def job_entries(
                 credentials.append(credential)
         entry: dict[str, Any] = {
             "name": str(template["name"]),
-            "url": ui_url(client, "job_template", template),
+            "url": api_url(client, "job_template", template),
+            "ui_url": ui_url(client, "job_template", template),
             "last_run": (
                 str(template["last_job_run"])
                 if template.get("last_job_run")
@@ -212,7 +258,10 @@ def build_report(
         for item in client.list(f"{base}/organizations/")
     }
     teams = client.list(f"{base}/teams/")
-    users = client.list(f"{base}/users/")
+    users_by_source = {base: client.list(f"{base}/users/")}
+    if base != CONTROLLER:
+        users_by_source[CONTROLLER] = client.list(f"{CONTROLLER}/users/")
+    user_principals, user_source_ids, user_records = merge_users(users_by_source)
     principals: dict[str, dict[str, tuple[str, str]]] = {
         "team": {
             key(item["id"]): (
@@ -221,13 +270,7 @@ def build_report(
             )
             for item in teams
         },
-        "user": {
-            key(item["id"]): (
-                str(item.get("username") or item.get("name") or item["id"]),
-                "",
-            )
-            for item in users
-        },
+        "user": user_principals,
     }
     definitions = {
         key(item["id"]): item for item in client.list(f"{base}/role_definitions/")
@@ -263,20 +306,30 @@ def build_report(
         if current is None or rank[level] > rank[current["level"]]:
             access[key(template["id"])][identity] = entry
 
-    for user in users:
-        if user.get("is_superuser") or user.get("is_platform_superuser"):
+    for identity, records in user_records.items():
+        if any(
+            user.get("is_superuser") or user.get("is_platform_superuser")
+            for user in records
+        ):
             level = "admin"
-        elif user.get("is_system_auditor") or user.get("is_platform_auditor"):
+        elif any(
+            user.get("is_system_auditor") or user.get("is_platform_auditor")
+            for user in records
+        ):
             level = "view"
         else:
             continue
         for template in templates:
-            add(template, "user", key(user["id"]), level)
+            add(template, "user", identity, level)
 
     for principal_type in ("team", "user"):
         assignments = client.list(f"{base}/role_{principal_type}_assignments/")
         for assignment in assignments:
             principal_id = key(assignment.get(principal_type))
+            if principal_type == "user":
+                principal_id = user_source_ids.get(
+                    (base, principal_id), principal_id
+                )
             definition = definitions.get(key(assignment.get("role_definition")), {})
             level = permission_level(definition.get("permissions", []))
             if not level:
@@ -373,6 +426,18 @@ def add_text(document: StandardLibraryPdf, value: str, bold: bool = False) -> No
         document.y -= 12
 
 
+def unique_resource_counts(report: list[dict[str, Any]]) -> tuple[int, int]:
+    inventories = {
+        job["inventory"]["url"] for job in report if job.get("inventory")
+    }
+    credentials = {
+        credential["url"]
+        for job in report
+        for credential in job.get("credentials", [])
+    }
+    return len(inventories), len(credentials)
+
+
 def render_pdf(
     report: list[dict[str, Any]],
     days: int,
@@ -387,12 +452,13 @@ def render_pdf(
         "unused": f"Not run within the last {days} days; never-run jobs included",
         "all": "All Job Templates; no date filter",
     }[mode]
+    inventory_count, credential_count = unique_resource_counts(report)
     overview = [
         ["Scope", scope],
         ["Cutoff", cutoff if mode != "all" else "Not applied"],
         ["Job Templates", len(report)],
-        ["Attached inventories", sum(job["inventory"] is not None for job in report)],
-        ["Attached credentials", sum(len(job["credentials"]) for job in report)],
+        ["Unique inventories", inventory_count],
+        ["Unique credentials", credential_count],
         ["RBAC permissions", "Checked" if rbac_checked else "Not checked"],
     ]
     table(
@@ -408,7 +474,7 @@ def render_pdf(
         TITLE,
         "Summary",
         ["Job Template", "URL"],
-        [[job["name"], job["url"]] for job in report],
+        [[job["name"], job["ui_url"]] for job in report],
         [250, 470],
     )
 
@@ -417,14 +483,14 @@ def render_pdf(
             document.new_page()
             page_heading(document, TITLE, "Details - continued")
         add_text(document, job["name"], True)
-        add_text(document, f"URL: {job['url']}")
+        add_text(document, f"URL: {job['ui_url']}")
         add_text(document, f"Last run: {job['last_run'] or 'Never'}")
         inventory = job["inventory"]
         add_text(
             document,
             "Inventory: none"
             if not inventory
-            else f"Inventory: {inventory['name']} - {inventory['url']}",
+            else f"Inventory: {inventory['name']} - {inventory['ui_url']}",
         )
         credentials = job["credentials"]
         add_text(
@@ -432,7 +498,9 @@ def render_pdf(
             "Credentials: none"
             if not credentials
             else "Credentials: "
-            + "; ".join(f"{item['name']} - {item['url']}" for item in credentials),
+            + "; ".join(
+                f"{item['name']} - {item['ui_url']}" for item in credentials
+            ),
         )
         if not job["permissions_checked"]:
             add_text(document, "Permissions: not checked")

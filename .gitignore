@@ -1,5 +1,6 @@
 lab.env
 .env
+output/
 team-resources.yaml
 team-resources.md
 team-resources.pdf

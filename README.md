@@ -44,12 +44,11 @@ AAP_URL=https://aap.example.com
 AAP_TOKEN='your-token'
 AAP_VALIDATE_CERTS=true
 
-# These five settings make the entire run non-interactive.
-AAP_REPORT_MODE=unused
+# These settings make the entire two-report run non-interactive.
 AAP_REPORT_DAYS=365
-AAP_CHECK_RBAC=false
-AAP_YAML_OUTPUT=unused-job-templates.yaml
-AAP_PDF_OUTPUT=unused-job-templates.pdf
+AAP_OUTPUT_ROOT=output
+AAP_USED_CHECK_RBAC=true
+AAP_UNUSED_CHECK_RBAC=false
 ```
 
 Run `./run-report.sh` after saving the file. Set `AAP_ENV_FILE=/path/to/file`
@@ -57,49 +56,52 @@ to load a different file. Environment files use normal shell assignment syntax.
 
 ## Run
 
-Job Templates run in the last year (the default):
+The shell wrapper automatically generates both reports for the same period:
 
 ```bash
-python3 scripts/export_recent_team_resources.py \
-  --output job-templates.yaml \
-  --pdf-output job-templates.pdf
+./run-report.sh
 ```
 
-Job Templates that have **not** run in the last year, including never-run jobs:
+With a 365-day period, it creates:
 
-```bash
-python3 scripts/export_recent_team_resources.py \
-  --unused \
-  --no-rbac \
-  --output unused-job-templates.yaml \
-  --pdf-output unused-job-templates.pdf
+```text
+output/
+  2026-08-20_14-30-00-used-and-unused-365-day-report/
+    used/
+      used-job-templates.yaml
+      used-job-templates.pdf
+    unused/
+      unused-job-templates.yaml
+      unused-job-templates.pdf
 ```
 
-Use `--no-rbac` to skip all permission API calls. The shell wrapper defaults to
-skipping RBAC for `unused` reports and checking it for `recent` or `all` reports.
-Use `--days 90` to change the cutoff or `--all` to remove the date filter.
-Omit `--output` to write YAML to stdout. The guided `./run-report.sh` wrapper
-loads saved settings and prompts only for values that are missing.
+The used report checks RBAC by default. The unused report skips RBAC by default.
+Set `AAP_USED_CHECK_RBAC` or `AAP_UNUSED_CHECK_RBAC` to override either choice.
+The direct Python command remains available for individual reports; run it with
+`--help` for its options.
 
 ## Output
 
-The summary is deliberately first and contains only each matching name and URL:
+The PDF overview counts unique inventories and credentials, even when several
+templates use the same resource. YAML URLs are Controller API endpoints; the
+PDF keeps human-facing AAP UI URLs. The YAML summary is deliberately first and
+contains only each matching name and URL:
 
 ```yaml
 summary:
   - name: "Deploy Payments"
-    url: "https://aap.example.com/execution/templates/job-template/24/details"
+    url: "https://aap.example.com/api/controller/v2/job_templates/24/"
 
 job_templates:
   - name: "Deploy Payments"
-    url: "https://aap.example.com/execution/templates/job-template/24/details"
+    url: "https://aap.example.com/api/controller/v2/job_templates/24/"
     last_run: "2026-08-12T15:20:12Z"
     inventory:
       name: "Payments Production"
-      url: "https://aap.example.com/execution/inventories/inventory/2/details"
+      url: "https://aap.example.com/api/controller/v2/inventories/2/"
     credentials:
       - name: "Payments SSH"
-        url: "https://aap.example.com/execution/credentials/3/details"
+        url: "https://aap.example.com/api/controller/v2/credentials/3/"
     permissions:
       - type: "team"
         name: "Payments Operators"
@@ -112,7 +114,9 @@ job_templates:
 
 The report uses `last_job_run`; it does not depend on retained job history.
 Permissions are the current direct or owning-organization grants reported by
-AAP, not a reconstruction of permissions that were revoked in the past.
+AAP, not a reconstruction of permissions that were revoked in the past. On
+Gateway-based versions, users are cross-referenced with Controller users by
+`ansible_id` and then username so legacy Controller identities are retained.
 
 The script supports the Controller 4.6-4.8 API layouts used by AAP 2.5-2.7.
 Controller 4.6 RBAC is read from Controller; later versions use Gateway RBAC.

@@ -86,56 +86,82 @@ if [[ -z "${AAP_TOKEN:-}" && \
 fi
 export AAP_URL AAP_TOKEN AAP_USERNAME AAP_PASSWORD
 
-report_mode="${AAP_REPORT_MODE:-recent}"
 days="${AAP_REPORT_DAYS:-365}"
-yaml_output="${AAP_YAML_OUTPUT:-job-templates.yaml}"
-pdf_output="${AAP_PDF_OUTPUT:-job-templates.pdf}"
-
-if [[ -z "${AAP_REPORT_MODE:-}" ]]; then
-  read -r -p "Report recent, unused, or all jobs? [${report_mode}]: " answer
-  report_mode="${answer:-${report_mode}}"
-fi
+output_root="${AAP_OUTPUT_ROOT:-${SCRIPT_DIR}/output}"
 if [[ -z "${AAP_REPORT_DAYS:-}" ]]; then
   read -r -p "Number of days [${days}]: " answer
   days="${answer:-${days}}"
 fi
-if [[ -z "${AAP_YAML_OUTPUT:-}" ]]; then
-  read -r -p "YAML output [${yaml_output}]: " answer
-  yaml_output="${answer:-${yaml_output}}"
+if [[ "${output_root}" != /* ]]; then
+  output_root="${SCRIPT_DIR}/${output_root}"
 fi
-if [[ -z "${AAP_PDF_OUTPUT:-}" ]]; then
-  read -r -p "PDF output [${pdf_output}]: " answer
-  pdf_output="${answer:-${pdf_output}}"
-fi
-
-rbac_default="yes"
-if [[ "${report_mode}" == "unused" ]]; then
-  rbac_default="no"
-fi
-check_rbac="${AAP_CHECK_RBAC:-${rbac_default}}"
-if [[ -z "${AAP_CHECK_RBAC:-}" ]]; then
-  read -r -p "Check team and user permissions? [${rbac_default}]: " answer
-  check_rbac="${answer:-${rbac_default}}"
+if [[ ! "${days}" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'ERROR: AAP_REPORT_DAYS must be a positive whole number.\n' >&2
+  exit 2
 fi
 
-mode_argument=()
-case "${report_mode}" in
-  recent) ;;
-  unused) mode_argument=(--unused) ;;
-  all) mode_argument=(--all) ;;
-  *) printf 'ERROR: choose recent, unused, or all.\n' >&2; exit 2 ;;
-esac
-
-rbac_argument=()
-case "${check_rbac}" in
+used_check_rbac=true
+case "${AAP_USED_CHECK_RBAC:-true}" in
   y|Y|yes|YES|true|TRUE|1) ;;
-  n|N|no|NO|false|FALSE|0) rbac_argument=(--no-rbac) ;;
-  *) printf 'ERROR: AAP_CHECK_RBAC must be yes or no.\n' >&2; exit 2 ;;
+  n|N|no|NO|false|FALSE|0) used_check_rbac=false ;;
+  *) printf 'ERROR: AAP_USED_CHECK_RBAC must be true or false.\n' >&2; exit 2 ;;
 esac
 
-"${python_launcher[@]}" "${SCRIPT}" \
-  "${mode_argument[@]}" \
-  "${rbac_argument[@]}" \
-  --days "${days}" \
-  --output "${yaml_output}" \
-  --pdf-output "${pdf_output}"
+unused_check_rbac=false
+case "${AAP_UNUSED_CHECK_RBAC:-false}" in
+  y|Y|yes|YES|true|TRUE|1) unused_check_rbac=true ;;
+  n|N|no|NO|false|FALSE|0) ;;
+  *) printf 'ERROR: AAP_UNUSED_CHECK_RBAC must be true or false.\n' >&2; exit 2 ;;
+esac
+
+timestamp="$(date '+%Y-%m-%d_%H-%M-%S')"
+run_name="${timestamp}-used-and-unused-${days}-day-report"
+run_directory="${output_root%/}/${run_name}"
+suffix=2
+while [[ -e "${run_directory}" ]]; do
+  run_directory="${output_root%/}/${run_name}-${suffix}"
+  suffix=$((suffix + 1))
+done
+used_directory="${run_directory}/used"
+unused_directory="${run_directory}/unused"
+mkdir -p "${used_directory}" "${unused_directory}"
+
+printf 'Report period: %s days\n' "${days}"
+printf 'Output directory: %s\n\n' "${run_directory}"
+
+run_report() {
+  local mode=$1
+  local check_rbac=$2
+  local directory=$3
+  local arguments=("${SCRIPT}")
+  if [[ "${mode}" == "unused" ]]; then
+    arguments+=(--unused)
+  fi
+  if [[ "${check_rbac}" == "false" ]]; then
+    arguments+=(--no-rbac)
+  fi
+  arguments+=(
+    --days "${days}"
+    --output "${directory}/${mode}-job-templates.yaml"
+    --pdf-output "${directory}/${mode}-job-templates.pdf"
+  )
+  "${python_launcher[@]}" "${arguments[@]}"
+}
+
+set +e
+printf 'Running used Job Template report...\n'
+run_report used "${used_check_rbac}" "${used_directory}"
+used_status=$?
+
+printf '\nRunning unused Job Template report...\n'
+run_report unused "${unused_check_rbac}" "${unused_directory}"
+unused_status=$?
+set -e
+
+if (( used_status != 0 || unused_status != 0 )); then
+  printf '\nERROR: used status=%s; unused status=%s\n' \
+    "${used_status}" "${unused_status}" >&2
+  exit 1
+fi
+
+printf '\nComplete. Reports are in %s\n' "${run_directory}"
