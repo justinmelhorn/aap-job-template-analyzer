@@ -158,46 +158,27 @@ while [[ -e "${run_directory}" ]]; do
   run_directory="${output_root%/}/${run_name}-${suffix}"
   suffix=$((suffix + 1))
 done
-used_directory="${run_directory}/used"
-unused_directory="${run_directory}/unused"
-mkdir -p "${used_directory}" "${unused_directory}"
-
 printf 'Report period: %s days\n' "${days}"
 printf 'Output directory: %s\n\n' "${run_directory}"
 
-run_report() {
-  local mode=$1
-  local check_rbac=$2
-  local directory=$3
-  local arguments=("${SCRIPT}")
-  if [[ "${mode}" == "unused" ]]; then
-    arguments+=(--unused)
-  fi
-  if [[ "${check_rbac}" == "false" ]]; then
-    arguments+=(--no-rbac)
-  fi
-  arguments+=(
-    --days "${days}"
-    --output "${directory}/${mode}-job-templates.yaml"
-    --pdf-output "${directory}/${mode}-job-templates.pdf"
-  )
-  "${python_launcher[@]}" "${arguments[@]}"
-}
+arguments=(
+  "${SCRIPT}"
+  --days "${days}"
+  --both-output-root "${run_directory}"
+)
+if [[ "${used_check_rbac}" == "false" ]]; then
+  arguments+=(--no-used-rbac)
+fi
+if [[ "${unused_check_rbac}" == "true" ]]; then
+  arguments+=(--unused-rbac)
+fi
 
-set +e
-printf 'Running used template report...\n'
-run_report used "${used_check_rbac}" "${used_directory}"
-used_status=$?
-
-printf '\nRunning unused template report...\n'
-run_report unused "${unused_check_rbac}" "${unused_directory}"
-unused_status=$?
-set -e
-
-if (( used_status != 0 || unused_status != 0 )); then
-  printf '\nERROR: used status=%s; unused status=%s\n' \
-    "${used_status}" "${unused_status}" >&2
-  exit 1
+printf 'Collecting data once for used and unused reports...\n'
+report_status=0
+"${python_launcher[@]}" "${arguments[@]}" || report_status=$?
+if (( report_status != 0 )); then
+  printf '\nERROR: report status=%s\n' "${report_status}" >&2
+  exit "${report_status}"
 fi
 
 printf '\nComplete. Reports are in %s\n' "${run_directory}"

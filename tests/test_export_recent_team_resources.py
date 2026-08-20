@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -132,23 +133,17 @@ class GatewayUserClient(FakeClient):
                     "id": "g-alice",
                     "ansible_id": "user-alice",
                     "username": "alice",
-                    "associated_authenticators": {"local-auth": {"uid": "alice"}},
                 },
                 {
                     "id": "g-ldap",
                     "ansible_id": "user-ldap",
                     "username": "ldap-admin",
                     "is_superuser": True,
-                    "associated_authenticators": {"ldap-auth": {"uid": "ldap-admin"}},
                 },
                 {
                     "id": "g-mixed",
                     "username": "mixed-admin",
                     "is_superuser": True,
-                    "associated_authenticators": {
-                        "local-auth": {"uid": "mixed-admin"},
-                        "ldap-auth": {"uid": "mixed-admin"},
-                    },
                 }
             ],
             "/api/controller/v2/users/": [
@@ -174,6 +169,12 @@ class GatewayUserClient(FakeClient):
                     "id": "ldap-auth",
                     "type": "ansible_base.authentication.authenticator_plugins.ldap",
                 },
+            ],
+            "/api/gateway/v1/authenticator_users/": [
+                {"user": "g-alice", "authenticator": "local-auth"},
+                {"user": "g-ldap", "authenticator": "ldap-auth"},
+                {"user": "g-mixed", "authenticator": "local-auth"},
+                {"user": "g-mixed", "authenticator": "ldap-auth"},
             ],
             "/api/gateway/v1/role_definitions/": [
                 {"id": "execute", "permissions": ["awx.execute_jobtemplate"]}
@@ -378,7 +379,7 @@ class ExportTests(unittest.TestCase):
         client = self.api_client()
         next_url = (
             "https://aap.example.com/api/controller/v2/users/"
-            "?page=2&page_size=50"
+            "?page=2&page_size=100"
         )
         client.get = mock.Mock(
             side_effect=[
@@ -391,7 +392,7 @@ class ExportTests(unittest.TestCase):
         with mock.patch.object(MODULE.sys, "stderr", new=stderr):
             self.assertEqual([{"id": 1}, {"id": 2}], client.list("/users/"))
         self.assertEqual(
-            [mock.call("/users/", {"page_size": 50}), mock.call(next_url)],
+            [mock.call("/users/", {"page_size": 100}), mock.call(next_url)],
             client.get.call_args_list,
         )
         self.assertEqual("Users: 1/2\nUsers: 2/2\n", stderr.getvalue())
@@ -406,14 +407,14 @@ class ExportTests(unittest.TestCase):
                 client.get("/api/gateway/v1/me/")
 
         self.assertEqual(1, urlopen.call_count)
-        self.assertEqual([mock.call(1)], sleep.call_args_list)
+        self.assertEqual([mock.call(0.5)], sleep.call_args_list)
 
-    def test_local_gateway_users_supports_older_authenticator_field(self):
+    def test_local_gateway_users_excludes_any_external_association(self):
         users = [
-            {"username": "unassociated"},
-            {"username": "local", "authenticators": [1]},
-            {"username": "ldap", "authenticators": [2]},
-            {"username": "mixed", "authenticators": [1, 2]},
+            {"id": "direct", "username": "direct"},
+            {"id": "local", "username": "local"},
+            {"id": "ldap", "username": "ldap"},
+            {"id": "mixed", "username": "mixed"},
         ]
         authenticators = [
             {
@@ -426,13 +427,24 @@ class ExportTests(unittest.TestCase):
             },
         ]
 
-        local, external = MODULE.local_gateway_users(users, authenticators)
+        associations = [
+            {"user": "local", "authenticator": 1},
+            {"user": "/api/gateway/v1/users/ldap/", "authenticator": 2},
+            {"user": "mixed", "authenticator": 1},
+            {"user": "mixed", "authenticator": 2},
+        ]
+
+        local, external = MODULE.local_gateway_users(
+            users, authenticators, associations
+        )
 
         self.assertEqual(
-            ["unassociated", "local", "mixed"],
+            ["direct", "local"],
             [user["username"] for user in local],
         )
-        self.assertEqual(["ldap"], [user["username"] for user in external])
+        self.assertEqual(
+            ["ldap", "mixed"], [user["username"] for user in external]
+        )
 
     def test_check_auth_mode_calls_gateway_me(self):
         client = mock.Mock()
@@ -469,7 +481,7 @@ class ExportTests(unittest.TestCase):
         self.assertEqual({"results": []}, response)
         self.assertEqual(3, urlopen.call_count)
         self.assertEqual(
-            [mock.call(1), mock.call(60), mock.call(120)], sleep.call_args_list
+            [mock.call(0.5), mock.call(60), mock.call(120)], sleep.call_args_list
         )
 
     def test_client_honors_a_longer_retry_after(self):
@@ -485,7 +497,7 @@ class ExportTests(unittest.TestCase):
         ):
             client.get("/api/controller/v2/users/")
 
-        self.assertEqual([mock.call(1), mock.call(180)], sleep.call_args_list)
+        self.assertEqual([mock.call(0.5), mock.call(180)], sleep.call_args_list)
 
     def test_client_stops_after_two_temporary_retries(self):
         client = self.api_client()
@@ -505,7 +517,7 @@ class ExportTests(unittest.TestCase):
 
         self.assertEqual(3, urlopen.call_count)
         self.assertEqual(
-            [mock.call(1), mock.call(60), mock.call(120)], sleep.call_args_list
+            [mock.call(0.5), mock.call(60), mock.call(120)], sleep.call_args_list
         )
 
     def test_client_does_not_retry_permanent_http_errors(self):
@@ -520,7 +532,7 @@ class ExportTests(unittest.TestCase):
                 client.get("/api/controller/v2/users/")
 
         self.assertEqual(1, urlopen.call_count)
-        self.assertEqual([mock.call(1)], sleep.call_args_list)
+        self.assertEqual([mock.call(0.5)], sleep.call_args_list)
 
     def test_client_does_not_retry_connection_failures(self):
         client = self.api_client()
@@ -534,7 +546,7 @@ class ExportTests(unittest.TestCase):
                 client.get("/api/controller/v2/users/")
 
         self.assertEqual(1, urlopen.call_count)
-        self.assertEqual([mock.call(1)], sleep.call_args_list)
+        self.assertEqual([mock.call(0.5)], sleep.call_args_list)
 
     def test_recent_report_has_resources_teams_users_and_summary(self):
         report, _ = MODULE.build_report(FakeClient(), 365, "recent")
@@ -658,6 +670,65 @@ class ExportTests(unittest.TestCase):
         self.assertEqual({"Truly Unused"}, jobs)
         self.assertEqual({"Dormant Workflow"}, workflows)
 
+    def test_combined_reports_collect_every_endpoint_once(self):
+        client = WorkflowClient()
+
+        reports, _ = MODULE.build_reports(
+            client, 365, {"recent": True, "unused": True}
+        )
+
+        for path in (
+            "/api/controller/v2/job_templates/",
+            "/api/controller/v2/workflow_job_templates/",
+            "/api/controller/v2/workflow_job_template_nodes/",
+            "/api/controller/v2/organizations/",
+            "/api/controller/v2/teams/",
+            "/api/controller/v2/users/",
+            "/api/controller/v2/role_definitions/",
+            "/api/controller/v2/role_team_assignments/",
+            "/api/controller/v2/role_user_assignments/",
+        ):
+            self.assertEqual(1, client.paths.count(path), path)
+        self.assertEqual(
+            {"Deploy", "Never Run", "Old Audit", "Nested Workflow", "Release Workflow"},
+            {item["name"] for item in reports["recent"]},
+        )
+        self.assertEqual(
+            {"Truly Unused", "Dormant Workflow"},
+            {item["name"] for item in reports["unused"]},
+        )
+        self.assertTrue(
+            all(item["permissions_checked"] for report in reports.values() for item in report)
+        )
+
+    def test_combined_cli_writes_used_and_unused_yaml_and_pdf(self):
+        client = WorkflowClient()
+        with tempfile.TemporaryDirectory() as output_root, mock.patch.object(
+            MODULE, "Client", return_value=client
+        ), mock.patch.object(
+            MODULE.sys,
+            "argv",
+            ["report", "--both-output-root", output_root],
+        ), mock.patch.object(MODULE.sys, "stderr", new=io.StringIO()):
+            self.assertEqual(0, MODULE.main())
+
+            used_yaml = Path(output_root) / "used" / "used-job-templates.yaml"
+            unused_yaml = Path(output_root) / "unused" / "unused-job-templates.yaml"
+            self.assertIn('name: "Deploy"', used_yaml.read_text())
+            unused_text = unused_yaml.read_text()
+            self.assertIn('name: "Truly Unused"', unused_text)
+            self.assertIn("permissions_checked: false", unused_text)
+            self.assertTrue(
+                (Path(output_root) / "used" / "used-job-templates.pdf")
+                .read_bytes()
+                .startswith(b"%PDF-1.4")
+            )
+            self.assertTrue(
+                (Path(output_root) / "unused" / "unused-job-templates.pdf")
+                .read_bytes()
+                .startswith(b"%PDF-1.4")
+            )
+
     def test_unused_includes_old_and_never_run_jobs(self):
         report, _ = MODULE.build_report(FakeClient(), 365, "unused")
         self.assertEqual(["Never Run", "Old Audit"], [item["name"] for item in report])
@@ -695,12 +766,14 @@ class ExportTests(unittest.TestCase):
         permissions = report[0]["permissions"]
         self.assertEqual(1, client.paths.count("/api/gateway/v1/teams/"))
         self.assertEqual(1, client.paths.count("/api/gateway/v1/authenticators/"))
+        self.assertEqual(
+            1, client.paths.count("/api/gateway/v1/authenticator_users/")
+        )
         self.assertIn("/api/controller/v2/users/", client.paths)
         self.assertEqual(
             [
                 {"type": "user", "name": "alice", "level": "execute"},
                 {"type": "user", "name": "legacy-admin", "level": "admin"},
-                {"type": "user", "name": "mixed-admin", "level": "admin"},
             ],
             permissions,
         )
@@ -708,7 +781,7 @@ class ExportTests(unittest.TestCase):
         pdf = MODULE.render_pdf(
             report, 365, "2025-08-19T00:00:00Z", "recent", rbac_checked=True
         )
-        self.assertIn(b"mixed-admin", pdf)
+        self.assertNotIn(b"mixed-admin", pdf)
         self.assertNotIn(b"ldap-admin", pdf)
 
     def test_empty_yaml_and_pdf(self):

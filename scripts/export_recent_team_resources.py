@@ -29,8 +29,8 @@ from standard_library_pdf import (
 CONTROLLER = "/api/controller/v2"
 GATEWAY = "/api/gateway/v1"
 TITLE = "AAP Template Report"
-PAGE_SIZE = 50
-REQUEST_DELAY = 1
+PAGE_SIZE = 100
+REQUEST_DELAY = 0.5
 RETRYABLE_HTTP_ERRORS = {429, 502, 503, 504}
 RETRY_DELAYS = (60, 120)
 AUTH_FAILURE_EXIT = 3
@@ -42,6 +42,7 @@ COLLECTION_NAMES = {
     "teams": "Teams",
     "users": "Users",
     "authenticators": "Authenticators",
+    "authenticator_users": "Authenticator users",
     "role_definitions": "Role definitions",
     "role_team_assignments": "Team role assignments",
     "role_user_assignments": "User role assignments",
@@ -243,35 +244,42 @@ def merge_users(
     return principals, source_ids, records
 
 
-def user_authenticator_ids(user: dict[str, Any]) -> set[str]:
-    """Return authenticator IDs from both older and newer Gateway responses."""
-    associated = user.get("associated_authenticators")
-    if isinstance(associated, dict):
-        return {key(value) for value in associated if key(value)}
-
-    authenticators = user.get("authenticators", [])
-    if not isinstance(authenticators, list):
-        authenticators = [authenticators]
-    return {key(value) for value in authenticators if key(value)}
-
-
 def local_gateway_users(
-    users: list[dict[str, Any]], authenticators: list[dict[str, Any]]
+    users: list[dict[str, Any]],
+    authenticators: list[dict[str, Any]],
+    authenticator_users: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     local_ids = {
         key(item["id"])
         for item in authenticators
         if str(item.get("type", "")).rsplit(".", 1)[-1]
-        in {"local", "controller_admin"}
+        in {"local", "legacy_password"}
     }
+    associations: dict[str, set[str]] = defaultdict(set)
+    for item in authenticator_users:
+        user_id = related_id(item, "user")
+        authenticator_id = related_id(item, "authenticator")
+        if not user_id or not authenticator_id:
+            raise ExportError("could not read a Gateway authenticator-user association")
+        associations[user_id].add(authenticator_id)
+
     local = []
     external = []
     for user in users:
-        authenticator_ids = user_authenticator_ids(user)
-        is_local = not authenticator_ids or bool(authenticator_ids & local_ids)
+        authenticator_ids = associations.get(key(user["id"]), set())
+        is_local = not authenticator_ids or authenticator_ids <= local_ids
         target = local if is_local else external
         target.append(user)
     return local, external
+
+
+def related_id(item: dict[str, Any], field: str) -> str:
+    value = item.get(field, item.get(f"{field}_id"))
+    if isinstance(value, dict):
+        value = value.get("id")
+    if isinstance(value, str) and value.startswith(("http://", "https://", "/")):
+        value = urllib.parse.urlparse(value).path.rstrip("/").rsplit("/", 1)[-1]
+    return key(value)
 
 
 def local_controller_user(user: dict[str, Any]) -> bool:
@@ -493,28 +501,37 @@ def workflow_entries(
     return sorted(report, key=lambda item: item["name"].casefold())
 
 
-def build_report(
+def collect_templates(
     client: Client,
-    days: int = 365,
-    mode: str = "recent",
-    check_rbac: bool = True,
-) -> tuple[list[dict[str, Any]], str]:
-    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat(
-        timespec="seconds"
-    ).replace("+00:00", "Z")
-    all_jobs = client.list(f"{CONTROLLER}/job_templates/", order_by="name")
-    all_workflows = client.list(
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    jobs = client.list(f"{CONTROLLER}/job_templates/", order_by="name")
+    workflows = client.list(
         f"{CONTROLLER}/workflow_job_templates/", order_by="name"
     )
-    all_nodes = (
+    nodes = (
         client.list(f"{CONTROLLER}/workflow_job_template_nodes/", order_by="id")
-        if all_workflows
+        if workflows
         else []
     )
-    used_jobs, used_workflows = used_template_ids(
-        all_jobs, all_workflows, all_nodes, cutoff
-    )
+    return jobs, workflows, nodes
 
+
+def select_templates(
+    all_jobs: list[dict[str, Any]],
+    all_workflows: list[dict[str, Any]],
+    all_nodes: list[dict[str, Any]],
+    used_jobs: set[str],
+    used_workflows: set[str],
+    mode: str,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
     def included(kind: str, item: dict[str, Any]) -> bool:
         if mode == "all":
             return True
@@ -532,7 +549,17 @@ def build_report(
         for item in all_nodes
         if key(item.get("workflow_job_template")) in workflow_ids
     ]
+    return jobs, workflows, nodes
 
+
+def build_report_from_templates(
+    client: Client,
+    jobs: list[dict[str, Any]],
+    workflows: list[dict[str, Any]],
+    nodes: list[dict[str, Any]],
+    cutoff: str,
+    check_rbac: bool = True,
+) -> tuple[list[dict[str, Any]], str]:
     def entries(
         access: Optional[
             dict[tuple[str, str], dict[tuple[str, str], dict[str, str]]]
@@ -589,8 +616,9 @@ def build_report(
     else:
         gateway_users = client.list(f"{base}/users/", label="Gateway users")
         authenticators = client.list(f"{base}/authenticators/")
+        authenticator_users = client.list(f"{base}/authenticator_users/")
         gateway_users, external_gateway_users = local_gateway_users(
-            gateway_users, authenticators
+            gateway_users, authenticators, authenticator_users
         )
         external_ids, external_names = user_identity_values(external_gateway_users)
         controller_users = [
@@ -722,6 +750,79 @@ def build_report(
                     add(kind, template, principal_type, principal_id, level)
 
     return entries(access), cutoff
+
+
+def build_reports(
+    client: Client,
+    days: int,
+    rbac_by_mode: dict[str, bool],
+) -> tuple[dict[str, list[dict[str, Any]]], str]:
+    """Build one or more reports from a single template collection pass."""
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat(
+        timespec="seconds"
+    ).replace("+00:00", "Z")
+    all_jobs, all_workflows, all_nodes = collect_templates(client)
+    used_jobs, used_workflows = used_template_ids(
+        all_jobs, all_workflows, all_nodes, cutoff
+    )
+    selected = {
+        mode: select_templates(
+            all_jobs,
+            all_workflows,
+            all_nodes,
+            used_jobs,
+            used_workflows,
+            mode,
+        )
+        for mode in rbac_by_mode
+    }
+
+    rbac_entries: dict[tuple[str, str], dict[str, Any]] = {}
+    if any(rbac_by_mode.values()) and (all_jobs or all_workflows):
+        report, _ = build_report_from_templates(
+            client,
+            all_jobs,
+            all_workflows,
+            all_nodes,
+            cutoff,
+            check_rbac=True,
+        )
+        rbac_entries = {(item["kind"], item["url"]): item for item in report}
+
+    reports = {}
+    for mode, check_rbac in rbac_by_mode.items():
+        jobs, workflows, nodes = selected[mode]
+        if check_rbac:
+            selected_urls = {
+                ("job_template", api_url(client, "job_template", item))
+                for item in jobs
+            } | {
+                (
+                    "workflow_job_template",
+                    api_url(client, "workflow_job_template", item),
+                )
+                for item in workflows
+            }
+            reports[mode] = [
+                entry
+                for identity, entry in rbac_entries.items()
+                if identity in selected_urls
+            ]
+        else:
+            reports[mode], _ = build_report_from_templates(
+                client, jobs, workflows, nodes, cutoff, check_rbac=False
+            )
+    return reports, cutoff
+
+
+def build_report(
+    client: Client,
+    days: int = 365,
+    mode: str = "recent",
+    check_rbac: bool = True,
+) -> tuple[list[dict[str, Any]], str]:
+    reports, cutoff = build_reports(client, days, {mode: check_rbac})
+    return reports[mode], cutoff
 
 
 def scalar(value: Optional[str]) -> str:
@@ -969,6 +1070,30 @@ def render_pdf(
     return document.finish()
 
 
+def write_report(
+    report: list[dict[str, Any]],
+    days: int,
+    cutoff: str,
+    mode: str,
+    rbac_checked: bool,
+    output: str,
+    pdf_output: Optional[str],
+) -> None:
+    yaml = render_yaml(report)
+    if output == "-":
+        sys.stdout.write(yaml)
+    else:
+        with open(output, "w", encoding="utf-8") as target:
+            target.write(yaml)
+        print(f"Wrote {output}", file=sys.stderr)
+    if pdf_output:
+        with open(pdf_output, "wb") as target:
+            target.write(
+                render_pdf(report, days, cutoff, mode, rbac_checked=rbac_checked)
+            )
+        print(f"Wrote {pdf_output}", file=sys.stderr)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -980,7 +1105,27 @@ def main() -> int:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--unused", action="store_true", help="not run within --days")
     mode.add_argument("--all", action="store_true", help="no date filter")
-    parser.add_argument("--no-rbac", action="store_true", help="skip permission checks")
+    mode.add_argument(
+        "--both-output-root",
+        metavar="DIRECTORY",
+        help="write used and unused YAML/PDF reports from one API collection",
+    )
+    parser.add_argument(
+        "--no-rbac",
+        action="store_true",
+        help="skip permission checks in single-report mode",
+    )
+    parser.add_argument(
+        "--no-used-rbac",
+        dest="used_rbac",
+        action="store_false",
+        help="skip used-report permissions in combined mode",
+    )
+    parser.add_argument(
+        "--unused-rbac",
+        action="store_true",
+        help="check unused-report permissions in combined mode",
+    )
     parser.add_argument("--output", default="-", help="YAML path; default: stdout")
     parser.add_argument("--pdf-output", help="optional PDF path")
     args = parser.parse_args()
@@ -993,28 +1138,45 @@ def main() -> int:
             client.get(f"{GATEWAY}/me/")
             print("Authentication verified.", file=sys.stderr)
             return 0
+        if args.both_output_root:
+            settings = {
+                "recent": ("used", args.used_rbac),
+                "unused": ("unused", args.unused_rbac),
+            }
+            reports, cutoff = build_reports(
+                client,
+                args.days,
+                {mode: check_rbac for mode, (_, check_rbac) in settings.items()},
+            )
+            for report_mode, (directory_name, check_rbac) in settings.items():
+                directory = os.path.join(args.both_output_root, directory_name)
+                os.makedirs(directory, exist_ok=True)
+                write_report(
+                    reports[report_mode],
+                    args.days,
+                    cutoff,
+                    report_mode,
+                    rbac_checked=check_rbac,
+                    output=os.path.join(
+                        directory, f"{directory_name}-job-templates.yaml"
+                    ),
+                    pdf_output=os.path.join(
+                        directory, f"{directory_name}-job-templates.pdf"
+                    ),
+                )
+            return 0
         report, cutoff = build_report(
             client, args.days, report_mode, check_rbac=not args.no_rbac
         )
-        output = render_yaml(report)
-        if args.output == "-":
-            sys.stdout.write(output)
-        else:
-            with open(args.output, "w", encoding="utf-8") as target:
-                target.write(output)
-            print(f"Wrote {args.output}", file=sys.stderr)
-        if args.pdf_output:
-            with open(args.pdf_output, "wb") as target:
-                target.write(
-                    render_pdf(
-                        report,
-                        args.days,
-                        cutoff,
-                        report_mode,
-                        rbac_checked=not args.no_rbac,
-                    )
-                )
-            print(f"Wrote {args.pdf_output}", file=sys.stderr)
+        write_report(
+            report,
+            args.days,
+            cutoff,
+            report_mode,
+            rbac_checked=not args.no_rbac,
+            output=args.output,
+            pdf_output=args.pdf_output,
+        )
     except AuthenticationError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return AUTH_FAILURE_EXIT

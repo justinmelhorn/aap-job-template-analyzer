@@ -82,14 +82,17 @@ output/
 
 The used report checks RBAC by default. The unused report skips RBAC by default.
 Set `AAP_USED_CHECK_RBAC` or `AAP_UNUSED_CHECK_RBAC` to override either choice.
+The wrapper collects Job Templates, Workflow Templates, and workflow steps once,
+then divides that data into used and unused reports in memory. RBAC collections
+also run at most once, including when enabled for both reports.
 The direct Python command remains available for individual reports; run it with
 `--help` for its options.
 
-API requests are deliberately low-impact: collections use pages of 50 and every
-request is delayed by one second. Temporary HTTP failures are retried only twice,
+API requests are deliberately low-impact: collections use pages of 100 and every
+request is delayed by half a second. Temporary HTTP failures are retried only twice,
 after at least 60 and 120 seconds. RBAC reports can therefore take several minutes
 in large environments; protecting AAP is prioritized over report speed. Each
-collection prints progress such as `Job templates: 50/200` using the count in
+collection prints progress such as `Job templates: 100/200` using the count in
 the existing API response, so progress does not require extra collection calls.
 
 ## Output
@@ -148,9 +151,10 @@ Nested workflows and their children are followed recursively. Those children are
 therefore included in the used report and excluded from the unused report.
 Permissions are the current direct or owning-organization grants reported by
 AAP, not a reconstruction of permissions that were revoked in the past. On
-Gateway-based versions, only users with no external authenticator or with a
-Local authenticator are shown. A user associated with both Local and LDAP is
-kept. Controller users with LDAP or external-account markers are excluded;
+Gateway-based versions, only users with no authenticator association or with
+only Local or `legacy_password` authenticator associations are shown. Any user
+with an external authenticator is excluded. Controller users with LDAP or
+external-account markers are excluded;
 remaining users are cross-referenced by `ansible_id` and then username so local
 legacy Controller identities are retained.
 
