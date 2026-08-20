@@ -72,6 +72,12 @@ class FakeClient:
             "/api/controller/v2/users/": [
                 {"id": 200, "username": "alice"},
                 {"id": 201, "username": "platform-admin", "is_superuser": True},
+                {
+                    "id": 202,
+                    "username": "ldap-admin",
+                    "is_superuser": True,
+                    "ldap_dn": "uid=ldap-admin,ou=people,dc=example,dc=com",
+                },
             ],
             "/api/controller/v2/role_definitions/": [
                 {
@@ -126,6 +132,23 @@ class GatewayUserClient(FakeClient):
                     "id": "g-alice",
                     "ansible_id": "user-alice",
                     "username": "alice",
+                    "associated_authenticators": {"local-auth": {"uid": "alice"}},
+                },
+                {
+                    "id": "g-ldap",
+                    "ansible_id": "user-ldap",
+                    "username": "ldap-admin",
+                    "is_superuser": True,
+                    "associated_authenticators": {"ldap-auth": {"uid": "ldap-admin"}},
+                },
+                {
+                    "id": "g-mixed",
+                    "username": "mixed-admin",
+                    "is_superuser": True,
+                    "associated_authenticators": {
+                        "local-auth": {"uid": "mixed-admin"},
+                        "ldap-auth": {"uid": "mixed-admin"},
+                    },
                 }
             ],
             "/api/controller/v2/users/": [
@@ -135,6 +158,22 @@ class GatewayUserClient(FakeClient):
                     "username": "alice-old-name",
                 },
                 {"id": 300, "username": "legacy-admin", "is_superuser": True},
+                {
+                    "id": 301,
+                    "ansible_id": "user-ldap",
+                    "username": "ldap-admin",
+                    "is_superuser": True,
+                },
+            ],
+            "/api/gateway/v1/authenticators/": [
+                {
+                    "id": "local-auth",
+                    "type": "ansible_base.authentication.authenticator_plugins.local",
+                },
+                {
+                    "id": "ldap-auth",
+                    "type": "ansible_base.authentication.authenticator_plugins.ldap",
+                },
             ],
             "/api/gateway/v1/role_definitions/": [
                 {"id": "execute", "permissions": ["awx.execute_jobtemplate"]}
@@ -343,16 +382,74 @@ class ExportTests(unittest.TestCase):
         )
         client.get = mock.Mock(
             side_effect=[
-                {"results": [{"id": 1}], "next": next_url},
+                {"count": 2, "results": [{"id": 1}], "next": next_url},
                 {"results": [{"id": 2}], "next": None},
             ]
         )
 
-        self.assertEqual([{"id": 1}, {"id": 2}], client.list("/users/"))
+        stderr = io.StringIO()
+        with mock.patch.object(MODULE.sys, "stderr", new=stderr):
+            self.assertEqual([{"id": 1}, {"id": 2}], client.list("/users/"))
         self.assertEqual(
             [mock.call("/users/", {"page_size": 50}), mock.call(next_url)],
             client.get.call_args_list,
         )
+        self.assertEqual("Users: 1/2\nUsers: 2/2\n", stderr.getvalue())
+
+    def test_client_reports_authentication_failure_separately(self):
+        client = self.api_client()
+
+        with mock.patch.object(
+            MODULE.urllib.request, "urlopen", side_effect=self.http_error(401)
+        ) as urlopen, mock.patch.object(MODULE.time, "sleep") as sleep:
+            with self.assertRaises(MODULE.AuthenticationError):
+                client.get("/api/gateway/v1/me/")
+
+        self.assertEqual(1, urlopen.call_count)
+        self.assertEqual([mock.call(1)], sleep.call_args_list)
+
+    def test_local_gateway_users_supports_older_authenticator_field(self):
+        users = [
+            {"username": "unassociated"},
+            {"username": "local", "authenticators": [1]},
+            {"username": "ldap", "authenticators": [2]},
+            {"username": "mixed", "authenticators": [1, 2]},
+        ]
+        authenticators = [
+            {
+                "id": 1,
+                "type": "ansible_base.authentication.authenticator_plugins.local",
+            },
+            {
+                "id": 2,
+                "type": "ansible_base.authentication.authenticator_plugins.ldap",
+            },
+        ]
+
+        local, external = MODULE.local_gateway_users(users, authenticators)
+
+        self.assertEqual(
+            ["unassociated", "local", "mixed"],
+            [user["username"] for user in local],
+        )
+        self.assertEqual(["ldap"], [user["username"] for user in external])
+
+    def test_check_auth_mode_calls_gateway_me(self):
+        client = mock.Mock()
+        with mock.patch.object(MODULE, "Client", return_value=client), mock.patch.object(
+            MODULE.sys, "argv", ["report", "--check-auth"]
+        ), mock.patch.object(MODULE.sys, "stderr", new=io.StringIO()):
+            self.assertEqual(0, MODULE.main())
+
+        client.get.assert_called_once_with("/api/gateway/v1/me/")
+
+    def test_check_auth_mode_returns_distinct_status_for_401(self):
+        client = mock.Mock()
+        client.get.side_effect = MODULE.AuthenticationError("HTTP 401")
+        with mock.patch.object(MODULE, "Client", return_value=client), mock.patch.object(
+            MODULE.sys, "argv", ["report", "--check-auth"]
+        ), mock.patch.object(MODULE.sys, "stderr", new=io.StringIO()):
+            self.assertEqual(MODULE.AUTH_FAILURE_EXIT, MODULE.main())
 
     def test_client_retries_temporary_errors_slowly(self):
         client = self.api_client()
@@ -597,14 +694,22 @@ class ExportTests(unittest.TestCase):
         report, _ = MODULE.build_report(client, 365, "recent")
         permissions = report[0]["permissions"]
         self.assertEqual(1, client.paths.count("/api/gateway/v1/teams/"))
+        self.assertEqual(1, client.paths.count("/api/gateway/v1/authenticators/"))
         self.assertIn("/api/controller/v2/users/", client.paths)
         self.assertEqual(
             [
                 {"type": "user", "name": "alice", "level": "execute"},
                 {"type": "user", "name": "legacy-admin", "level": "admin"},
+                {"type": "user", "name": "mixed-admin", "level": "admin"},
             ],
             permissions,
         )
+        self.assertNotIn("ldap-admin", [item["name"] for item in permissions])
+        pdf = MODULE.render_pdf(
+            report, 365, "2025-08-19T00:00:00Z", "recent", rbac_checked=True
+        )
+        self.assertIn(b"mixed-admin", pdf)
+        self.assertNotIn(b"ldap-admin", pdf)
 
     def test_empty_yaml_and_pdf(self):
         self.assertEqual(

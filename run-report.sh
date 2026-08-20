@@ -70,21 +70,57 @@ if [[ -z "${AAP_URL:-}" ]]; then
   read -r -p 'AAP Platform Gateway URL: ' AAP_URL
 fi
 
-if [[ -z "${AAP_TOKEN:-}" && \
-      ( -z "${AAP_USERNAME:-}" || -z "${AAP_PASSWORD:-}" ) ]]; then
+prompt_for_auth() {
+  if [[ ! -t 0 ]]; then
+    printf 'ERROR: valid AAP credentials are required; cannot prompt without a terminal.\n' >&2
+    return 1
+  fi
+  unset AAP_TOKEN AAP_USERNAME AAP_PASSWORD
   read -r -p 'Use token authentication? [y/N]: ' token_answer
   if [[ "${token_answer:-n}" =~ ^[yY] ]]; then
     read -r -s -p 'AAP token: ' AAP_TOKEN
     printf '\n'
   else
-    if [[ -z "${AAP_USERNAME:-}" ]]; then
-      read -r -p 'AAP username: ' AAP_USERNAME
-    fi
+    read -r -p 'AAP username: ' AAP_USERNAME
     read -r -s -p 'AAP password: ' AAP_PASSWORD
     printf '\n'
   fi
+  export AAP_TOKEN AAP_USERNAME AAP_PASSWORD
+}
+
+if [[ -z "${AAP_TOKEN:-}" && \
+      ( -z "${AAP_USERNAME:-}" || -z "${AAP_PASSWORD:-}" ) ]]; then
+  prompt_for_auth
 fi
 export AAP_URL AAP_TOKEN AAP_USERNAME AAP_PASSWORD
+
+check_auth() {
+  local attempt=1
+  local status
+  while true; do
+    if "${python_launcher[@]}" "${SCRIPT}" --check-auth; then
+      return 0
+    else
+      status=$?
+    fi
+    if (( status != 3 )); then
+      return "${status}"
+    fi
+    if (( attempt >= 3 )); then
+      printf 'ERROR: authentication failed after %s attempts.\n' "${attempt}" >&2
+      return 3
+    fi
+    printf 'Authentication failed. Please enter credentials again.\n' >&2
+    prompt_for_auth || return $?
+    attempt=$((attempt + 1))
+  done
+}
+
+auth_status=0
+check_auth || auth_status=$?
+if (( auth_status != 0 )); then
+  exit "${auth_status}"
+fi
 
 days="${AAP_REPORT_DAYS:-365}"
 output_root="${AAP_OUTPUT_ROOT:-${SCRIPT_DIR}/output}"

@@ -5,7 +5,7 @@ A small, read-only Python script that reports:
 - Job and Workflow Templates and their AAP URLs
 - attached inventories and credentials (names and URLs only)
 - configured workflow steps and their success, failure, and always paths
-- teams and users with current view, execute, or admin permission
+- teams and local users with current view, execute, or admin permission
 - recently used, unused, or all templates
 
 It writes simple YAML and, optionally, a dependency-free PDF. The PDF starts
@@ -54,6 +54,10 @@ AAP_UNUSED_CHECK_RBAC=false
 
 Run `./run-report.sh` after saving the file. Set `AAP_ENV_FILE=/path/to/file`
 to load a different file. Environment files use normal shell assignment syntax.
+Before creating reports, the wrapper verifies authentication with
+`/api/gateway/v1/me/`. An interactive run prompts again after a `401`, up to
+three total attempts. Non-authentication failures and non-interactive runs stop
+with a clear error instead of prompting.
 
 ## Run
 
@@ -84,7 +88,9 @@ The direct Python command remains available for individual reports; run it with
 API requests are deliberately low-impact: collections use pages of 50 and every
 request is delayed by one second. Temporary HTTP failures are retried only twice,
 after at least 60 and 120 seconds. RBAC reports can therefore take several minutes
-in large environments; protecting AAP is prioritized over report speed.
+in large environments; protecting AAP is prioritized over report speed. Each
+collection prints progress such as `Job templates: 50/200` using the count in
+the existing API response, so progress does not require extra collection calls.
 
 ## Output
 
@@ -142,8 +148,11 @@ Nested workflows and their children are followed recursively. Those children are
 therefore included in the used report and excluded from the unused report.
 Permissions are the current direct or owning-organization grants reported by
 AAP, not a reconstruction of permissions that were revoked in the past. On
-Gateway-based versions, users are cross-referenced with Controller users by
-`ansible_id` and then username so legacy Controller identities are retained.
+Gateway-based versions, only users with no external authenticator or with a
+Local authenticator are shown. A user associated with both Local and LDAP is
+kept. Controller users with LDAP or external-account markers are excluded;
+remaining users are cross-referenced by `ansible_id` and then username so local
+legacy Controller identities are retained.
 
 The script supports the Controller 4.6-4.8 API layouts used by AAP 2.5-2.7.
 Controller 4.6 RBAC is read from Controller; later versions use Gateway RBAC.

@@ -33,6 +33,19 @@ PAGE_SIZE = 50
 REQUEST_DELAY = 1
 RETRYABLE_HTTP_ERRORS = {429, 502, 503, 504}
 RETRY_DELAYS = (60, 120)
+AUTH_FAILURE_EXIT = 3
+COLLECTION_NAMES = {
+    "job_templates": "Job templates",
+    "workflow_job_templates": "Workflow templates",
+    "workflow_job_template_nodes": "Workflow steps",
+    "organizations": "Organizations",
+    "teams": "Teams",
+    "users": "Users",
+    "authenticators": "Authenticators",
+    "role_definitions": "Role definitions",
+    "role_team_assignments": "Team role assignments",
+    "role_user_assignments": "User role assignments",
+}
 STEP_KINDS = {
     "job": "job_template",
     "job_template": "job_template",
@@ -46,6 +59,10 @@ STEP_KINDS = {
 
 
 class ExportError(RuntimeError):
+    pass
+
+
+class AuthenticationError(ExportError):
     pass
 
 
@@ -86,6 +103,10 @@ class Client:
                 ) as response:
                     return json.load(response)
             except urllib.error.HTTPError as exc:
+                if exc.code == 401:
+                    raise AuthenticationError(
+                        f"GET {url} returned HTTP 401; check your credentials"
+                    ) from exc
                 if exc.code not in RETRYABLE_HTTP_ERRORS or attempt == len(RETRY_DELAYS):
                     raise ExportError(f"GET {url} returned HTTP {exc.code}") from exc
                 delay = RETRY_DELAYS[attempt]
@@ -101,14 +122,28 @@ class Client:
 
         raise AssertionError("unreachable")
 
-    def list(self, path: str, **params: Any) -> list[dict[str, Any]]:
+    def list(
+        self, path: str, label: Optional[str] = None, **params: Any
+    ) -> list[dict[str, Any]]:
         params["page_size"] = PAGE_SIZE
         page = self.get(path, params)
         results = list(page.get("results", []))
+        total = page.get("count")
+        name = label or collection_name(path)
+        if isinstance(total, int):
+            print(f"{name}: {min(len(results), total)}/{total}", file=sys.stderr)
         while page.get("next"):
             page = self.get(page["next"])
             results.extend(page.get("results", []))
+            if isinstance(total, int):
+                print(f"{name}: {min(len(results), total)}/{total}", file=sys.stderr)
         return results
+
+
+def collection_name(path_or_url: str) -> str:
+    path = urllib.parse.urlparse(path_or_url).path.rstrip("/")
+    endpoint = path.rsplit("/", 1)[-1]
+    return COLLECTION_NAMES.get(endpoint, endpoint.replace("_", " ").title())
 
 
 def key(value: Any) -> str:
@@ -206,6 +241,51 @@ def merge_users(
             source_ids[(source, key(user["id"]))] = identity
             records[identity].append(user)
     return principals, source_ids, records
+
+
+def user_authenticator_ids(user: dict[str, Any]) -> set[str]:
+    """Return authenticator IDs from both older and newer Gateway responses."""
+    associated = user.get("associated_authenticators")
+    if isinstance(associated, dict):
+        return {key(value) for value in associated if key(value)}
+
+    authenticators = user.get("authenticators", [])
+    if not isinstance(authenticators, list):
+        authenticators = [authenticators]
+    return {key(value) for value in authenticators if key(value)}
+
+
+def local_gateway_users(
+    users: list[dict[str, Any]], authenticators: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    local_ids = {
+        key(item["id"])
+        for item in authenticators
+        if str(item.get("type", "")).rsplit(".", 1)[-1]
+        in {"local", "controller_admin"}
+    }
+    local = []
+    external = []
+    for user in users:
+        authenticator_ids = user_authenticator_ids(user)
+        is_local = not authenticator_ids or bool(authenticator_ids & local_ids)
+        target = local if is_local else external
+        target.append(user)
+    return local, external
+
+
+def local_controller_user(user: dict[str, Any]) -> bool:
+    return not user.get("ldap_dn") and not user.get("external_account")
+
+
+def user_identity_values(
+    users: list[dict[str, Any]],
+) -> tuple[set[str], set[str]]:
+    ansible_ids = {key(user.get("ansible_id")) for user in users}
+    usernames = {
+        str(user.get("username") or "").casefold() for user in users
+    }
+    return ansible_ids - {""}, usernames - {""}
 
 
 def rbac_base(client: Client) -> str:
@@ -498,9 +578,32 @@ def build_report(
         for item in client.list(f"{base}/organizations/")
     }
     teams = client.list(f"{base}/teams/")
-    users_by_source = {base: client.list(f"{base}/users/")}
-    if base != CONTROLLER:
-        users_by_source[CONTROLLER] = client.list(f"{CONTROLLER}/users/")
+    if base == CONTROLLER:
+        users_by_source = {
+            base: [
+                user
+                for user in client.list(f"{base}/users/", label="Controller users")
+                if local_controller_user(user)
+            ]
+        }
+    else:
+        gateway_users = client.list(f"{base}/users/", label="Gateway users")
+        authenticators = client.list(f"{base}/authenticators/")
+        gateway_users, external_gateway_users = local_gateway_users(
+            gateway_users, authenticators
+        )
+        external_ids, external_names = user_identity_values(external_gateway_users)
+        controller_users = [
+            user
+            for user in client.list(f"{CONTROLLER}/users/", label="Controller users")
+            if local_controller_user(user)
+            and key(user.get("ansible_id")) not in external_ids
+            and str(user.get("username") or "").casefold() not in external_names
+        ]
+        users_by_source = {
+            base: gateway_users,
+            CONTROLLER: controller_users,
+        }
     user_principals, user_source_ids, user_records = merge_users(users_by_source)
     principals: dict[str, dict[str, tuple[str, str]]] = {
         "team": {
@@ -868,6 +971,11 @@ def render_pdf(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check-auth",
+        action="store_true",
+        help="verify credentials with the Platform Gateway and exit",
+    )
     parser.add_argument("--days", type=int, default=365, help="cutoff; default: 365")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--unused", action="store_true", help="not run within --days")
@@ -880,8 +988,13 @@ def main() -> int:
         parser.error("--days must be at least 1")
     report_mode = "all" if args.all else "unused" if args.unused else "recent"
     try:
+        client = Client()
+        if args.check_auth:
+            client.get(f"{GATEWAY}/me/")
+            print("Authentication verified.", file=sys.stderr)
+            return 0
         report, cutoff = build_report(
-            Client(), args.days, report_mode, check_rbac=not args.no_rbac
+            client, args.days, report_mode, check_rbac=not args.no_rbac
         )
         output = render_yaml(report)
         if args.output == "-":
@@ -902,6 +1015,9 @@ def main() -> int:
                     )
                 )
             print(f"Wrote {args.pdf_output}", file=sys.stderr)
+    except AuthenticationError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return AUTH_FAILURE_EXIT
     except (ExportError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
