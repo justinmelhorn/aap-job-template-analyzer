@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import io
 import importlib.util
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPTS = Path(__file__).parents[1] / "scripts"
@@ -152,6 +154,30 @@ class GatewayUserClient(FakeClient):
 
 
 class ExportTests(unittest.TestCase):
+    def test_client_retries_a_temporary_503(self):
+        client = MODULE.Client.__new__(MODULE.Client)
+        client.base_url = "https://aap.example.com"
+        client.authorization = "Bearer test"
+        client.context = None
+        unavailable = MODULE.urllib.error.HTTPError(
+            "https://aap.example.com/api/controller/v2/users/",
+            503,
+            "Service Unavailable",
+            {},
+            None,
+        )
+
+        with mock.patch.object(
+            MODULE.urllib.request,
+            "urlopen",
+            side_effect=[unavailable, io.BytesIO(b'{"results": []}')],
+        ) as urlopen, mock.patch.object(MODULE.time, "sleep") as sleep:
+            response = client.get("/api/controller/v2/users/")
+
+        self.assertEqual({"results": []}, response)
+        self.assertEqual(2, urlopen.call_count)
+        sleep.assert_called_once_with(1)
+
     def test_recent_report_has_resources_teams_users_and_summary(self):
         report, _ = MODULE.build_report(FakeClient(), 365, "recent")
         self.assertEqual(["Deploy"], [item["name"] for item in report])

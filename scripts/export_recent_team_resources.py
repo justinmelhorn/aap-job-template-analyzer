@@ -9,6 +9,7 @@ import json
 import os
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -28,6 +29,8 @@ from standard_library_pdf import (
 CONTROLLER = "/api/controller/v2"
 GATEWAY = "/api/gateway/v1"
 TITLE = "AAP Job Template Report"
+RETRYABLE_HTTP_ERRORS = {429, 502, 503, 504}
+RETRY_DELAYS = (1, 2, 4)
 
 
 class ExportError(RuntimeError):
@@ -62,15 +65,28 @@ class Client:
             url,
             headers={"Accept": "application/json", "Authorization": self.authorization},
         )
-        try:
-            with urllib.request.urlopen(
-                request, context=self.context, timeout=60
-            ) as response:
-                return json.load(response)
-        except urllib.error.HTTPError as exc:
-            raise ExportError(f"GET {url} returned HTTP {exc.code}") from exc
-        except urllib.error.URLError as exc:
-            raise ExportError(f"GET {url} failed: {exc.reason}") from exc
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            try:
+                with urllib.request.urlopen(
+                    request, context=self.context, timeout=60
+                ) as response:
+                    return json.load(response)
+            except urllib.error.HTTPError as exc:
+                if exc.code not in RETRYABLE_HTTP_ERRORS or attempt == len(RETRY_DELAYS):
+                    raise ExportError(f"GET {url} returned HTTP {exc.code}") from exc
+                delay = RETRY_DELAYS[attempt]
+                retry_after = exc.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    delay = max(delay, int(retry_after))
+                print(
+                    f"GET {url} returned HTTP {exc.code}; retrying in {delay}s",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+            except urllib.error.URLError as exc:
+                raise ExportError(f"GET {url} failed: {exc.reason}") from exc
+
+        raise AssertionError("unreachable")
 
     def list(self, path: str, **params: Any) -> list[dict[str, Any]]:
         params["page_size"] = 200
