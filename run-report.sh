@@ -150,6 +150,13 @@ case "${AAP_UNUSED_CHECK_RBAC:-false}" in
   *) printf 'ERROR: AAP_UNUSED_CHECK_RBAC must be true or false.\n' >&2; exit 2 ;;
 esac
 
+check_users=true
+case "${AAP_CHECK_USERS:-true}" in
+  y|Y|yes|YES|true|TRUE|1) ;;
+  n|N|no|NO|false|FALSE|0) check_users=false ;;
+  *) printf 'ERROR: AAP_CHECK_USERS must be true or false.\n' >&2; exit 2 ;;
+esac
+
 timestamp="$(date '+%Y-%m-%d_%H-%M-%S')"
 run_name="${timestamp}-used-and-unused-${days}-day-report"
 run_directory="${output_root%/}/${run_name}"
@@ -171,6 +178,9 @@ if [[ "${used_check_rbac}" == "false" ]]; then
 fi
 if [[ "${unused_check_rbac}" == "true" ]]; then
   arguments+=(--unused-rbac)
+fi
+if [[ "${check_users}" == "false" ]]; then
+  arguments+=(--no-users)
 fi
 
 printf 'Collecting data once for used and unused reports...\n'

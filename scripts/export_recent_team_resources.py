@@ -30,7 +30,7 @@ CONTROLLER = "/api/controller/v2"
 GATEWAY = "/api/gateway/v1"
 TITLE = "AAP Template Report"
 PAGE_SIZE = 100
-REQUEST_DELAY = 0.5
+REQUEST_DELAY = 0.25
 RETRYABLE_HTTP_ERRORS = {429, 502, 503, 504}
 RETRY_DELAYS = (60, 120)
 AUTH_FAILURE_EXIT = 3
@@ -224,8 +224,9 @@ def merge_users(
     for users in users_by_source.values():
         for user in users:
             username = str(user.get("username") or "").casefold()
-            if username and user.get("ansible_id"):
-                stable_by_username[username].add(key(user["ansible_id"]))
+            stable = ansible_id(user)
+            if username and stable:
+                stable_by_username[username].add(stable)
 
     principals: dict[str, tuple[str, str]] = {}
     source_ids: dict[tuple[str, str], str] = {}
@@ -234,7 +235,7 @@ def merge_users(
         for user in users:
             username = str(user.get("username") or user.get("name") or user["id"])
             normalized_username = username.casefold()
-            stable = key(user.get("ansible_id"))
+            stable = ansible_id(user)
             if not stable and len(stable_by_username[normalized_username]) == 1:
                 stable = next(iter(stable_by_username[normalized_username]))
             identity = f"ansible:{stable}" if stable else f"username:{normalized_username}"
@@ -248,52 +249,127 @@ def local_gateway_users(
     users: list[dict[str, Any]],
     authenticators: list[dict[str, Any]],
     authenticator_users: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    """Return users with only local, external, and unknown authenticators."""
     local_ids = {
         key(item["id"])
         for item in authenticators
         if str(item.get("type", "")).rsplit(".", 1)[-1]
         in {"local", "legacy_password"}
     }
+    users_by_reference: dict[str, str] = {}
+    authenticators_by_reference: dict[str, str] = {}
+    for user in users:
+        user_id = key(user["id"])
+        for reference in (user_id, ansible_id(user)):
+            if not reference:
+                continue
+            existing = users_by_reference.get(reference)
+            if existing and existing != user_id:
+                raise ExportError("could not uniquely match a Gateway user association")
+            users_by_reference[reference] = user_id
+
+    for authenticator in authenticators:
+        authenticator_id = key(authenticator["id"])
+        for reference in (
+            authenticator_id,
+            ansible_id(authenticator),
+            key(authenticator.get("slug")),
+        ):
+            if not reference:
+                continue
+            existing = authenticators_by_reference.get(reference)
+            if existing and existing != authenticator_id:
+                raise ExportError("could not uniquely match a Gateway authenticator")
+            authenticators_by_reference[reference] = authenticator_id
+
     associations: dict[str, set[str]] = defaultdict(set)
     for item in authenticator_users:
-        user_id = related_id(item, "user")
-        authenticator_id = related_id(item, "authenticator")
+        user_reference = related_id(item, "user")
+        provider_reference = related_id(item, "provider") or related_id(
+            item, "authenticator"
+        )
+        user_id = users_by_reference.get(user_reference)
+        authenticator_id = authenticators_by_reference.get(provider_reference)
         if not user_id or not authenticator_id:
             raise ExportError("could not read a Gateway authenticator-user association")
         associations[user_id].add(authenticator_id)
 
     local = []
     external = []
+    unknown = []
     for user in users:
         authenticator_ids = associations.get(key(user["id"]), set())
-        is_local = not authenticator_ids or authenticator_ids <= local_ids
-        target = local if is_local else external
+        if not authenticator_ids:
+            target = unknown
+        elif authenticator_ids <= local_ids:
+            target = local
+        else:
+            target = external
         target.append(user)
-    return local, external
+    return local, external, unknown
 
 
 def related_id(item: dict[str, Any], field: str) -> str:
-    value = item.get(field, item.get(f"{field}_id"))
-    if isinstance(value, dict):
-        value = value.get("id")
-    if isinstance(value, str) and value.startswith(("http://", "https://", "/")):
-        value = urllib.parse.urlparse(value).path.rstrip("/").rsplit("/", 1)[-1]
-    return key(value)
+    values = (
+        item.get("summary_fields", {}).get(field, {}).get("id"),
+        item.get("related", {}).get(field),
+        item.get(field, item.get(f"{field}_id")),
+    )
+    for value in values:
+        if isinstance(value, dict):
+            value = value.get("id")
+        if isinstance(value, str) and value.startswith(
+            ("http://", "https://", "/")
+        ):
+            value = urllib.parse.urlparse(value).path.rstrip("/").rsplit("/", 1)[-1]
+        if value is not None:
+            return key(value)
+    return ""
 
 
-def local_controller_user(user: dict[str, Any]) -> bool:
-    return not user.get("ldap_dn") and not user.get("external_account")
+def ansible_id(item: dict[str, Any]) -> str:
+    return key(
+        item.get("ansible_id")
+        or item.get("summary_fields", {}).get("resource", {}).get("ansible_id")
+    )
 
 
 def user_identity_values(
     users: list[dict[str, Any]],
 ) -> tuple[set[str], set[str]]:
-    ansible_ids = {key(user.get("ansible_id")) for user in users}
+    ansible_ids = {ansible_id(user) for user in users}
     usernames = {
         str(user.get("username") or "").casefold() for user in users
     }
     return ansible_ids - {""}, usernames - {""}
+
+
+def controller_users_for_gateway_locals(
+    controller_users: list[dict[str, Any]],
+    gateway_users: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep Controller records only when they match a proven-local Gateway user."""
+    local_ids, _unused = user_identity_values(gateway_users)
+    local_usernames: dict[str, int] = defaultdict(int)
+    for user in gateway_users:
+        username = str(user.get("username") or "").casefold()
+        if username:
+            local_usernames[username] += 1
+
+    matched = []
+    for user in controller_users:
+        stable = ansible_id(user)
+        username = str(user.get("username") or "").casefold()
+        if stable and stable in local_ids:
+            matched.append(user)
+        elif not stable and local_usernames.get(username) == 1:
+            matched.append(user)
+    return matched
 
 
 def rbac_base(client: Client) -> str:
@@ -559,6 +635,7 @@ def build_report_from_templates(
     nodes: list[dict[str, Any]],
     cutoff: str,
     check_rbac: bool = True,
+    check_users: bool = True,
 ) -> tuple[list[dict[str, Any]], str]:
     def entries(
         access: Optional[
@@ -605,34 +682,32 @@ def build_report_from_templates(
         for item in client.list(f"{base}/organizations/")
     }
     teams = client.list(f"{base}/teams/")
-    if base == CONTROLLER:
-        users_by_source = {
-            base: [
-                user
-                for user in client.list(f"{base}/users/", label="Controller users")
-                if local_controller_user(user)
-            ]
-        }
-    else:
-        gateway_users = client.list(f"{base}/users/", label="Gateway users")
-        authenticators = client.list(f"{base}/authenticators/")
-        authenticator_users = client.list(f"{base}/authenticator_users/")
-        gateway_users, external_gateway_users = local_gateway_users(
-            gateway_users, authenticators, authenticator_users
+    user_principals = {}
+    user_source_ids = {}
+    user_records: dict[str, list[dict[str, Any]]] = {}
+    if check_users:
+        gateway_users = client.list(f"{GATEWAY}/users/", label="Gateway users")
+        authenticators = client.list(f"{GATEWAY}/authenticators/")
+        authenticator_users = client.list(f"{GATEWAY}/authenticator_users/")
+        gateway_users, _, unknown_gateway_users = (
+            local_gateway_users(gateway_users, authenticators, authenticator_users)
         )
-        external_ids, external_names = user_identity_values(external_gateway_users)
-        controller_users = [
-            user
-            for user in client.list(f"{CONTROLLER}/users/", label="Controller users")
-            if local_controller_user(user)
-            and key(user.get("ansible_id")) not in external_ids
-            and str(user.get("username") or "").casefold() not in external_names
-        ]
+        if unknown_gateway_users:
+            print(
+                "WARNING: excluded "
+                f"{len(unknown_gateway_users)} Gateway user(s) without an "
+                "authenticator association.",
+                file=sys.stderr,
+            )
+        controller_users = controller_users_for_gateway_locals(
+            client.list(f"{CONTROLLER}/users/", label="Controller users"),
+            gateway_users,
+        )
         users_by_source = {
-            base: gateway_users,
+            GATEWAY: gateway_users,
             CONTROLLER: controller_users,
         }
-    user_principals, user_source_ids, user_records = merge_users(users_by_source)
+        user_principals, user_source_ids, user_records = merge_users(users_by_source)
     principals: dict[str, dict[str, tuple[str, str]]] = {
         "team": {
             key(item["id"]): (
@@ -688,35 +763,37 @@ def build_report_from_templates(
         if current is None or rank[level] > rank[current["level"]]:
             access[template_identity][identity] = entry
 
-    for identity, records in user_records.items():
-        if any(
-            user.get("is_superuser") or user.get("is_platform_superuser")
-            for user in records
-        ):
-            level = "admin"
-        elif any(
-            user.get("is_system_auditor") or user.get("is_platform_auditor")
-            for user in records
-        ):
-            level = "view"
-        else:
-            continue
-        for kind, items in templates.items():
-            for template in items:
-                add(kind, template, "user", identity, level)
+    if check_users:
+        for identity, records in user_records.items():
+            if any(
+                user.get("is_superuser") or user.get("is_platform_superuser")
+                for user in records
+            ):
+                level = "admin"
+            elif any(
+                user.get("is_system_auditor") or user.get("is_platform_auditor")
+                for user in records
+            ):
+                level = "view"
+            else:
+                continue
+            for kind, items in templates.items():
+                for template in items:
+                    add(kind, template, "user", identity, level)
 
     content_types = {
         "awx.jobtemplate": "job_template",
         "awx.workflowjobtemplate": "workflow_job_template",
     }
-    for principal_type in ("team", "user"):
+    principal_types = ("team", "user") if check_users else ("team",)
+    for principal_type in principal_types:
         assignments = client.list(f"{base}/role_{principal_type}_assignments/")
         for assignment in assignments:
             principal_id = key(assignment.get(principal_type))
             if principal_type == "user":
-                principal_id = user_source_ids.get(
-                    (base, principal_id), principal_id
-                )
+                principal_id = user_source_ids.get((base, principal_id), "")
+                if not principal_id and assignment.get("user_ansible_id"):
+                    principal_id = f"ansible:{key(assignment['user_ansible_id'])}"
             definition = definitions.get(key(assignment.get("role_definition")), {})
             level = permission_level(definition.get("permissions", []))
             if not level:
@@ -756,6 +833,7 @@ def build_reports(
     client: Client,
     days: int,
     rbac_by_mode: dict[str, bool],
+    check_users: bool = True,
 ) -> tuple[dict[str, list[dict[str, Any]]], str]:
     """Build one or more reports from a single template collection pass."""
     cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat(
@@ -786,6 +864,7 @@ def build_reports(
             all_nodes,
             cutoff,
             check_rbac=True,
+            check_users=check_users,
         )
         rbac_entries = {(item["kind"], item["url"]): item for item in report}
 
@@ -810,7 +889,13 @@ def build_reports(
             ]
         else:
             reports[mode], _ = build_report_from_templates(
-                client, jobs, workflows, nodes, cutoff, check_rbac=False
+                client,
+                jobs,
+                workflows,
+                nodes,
+                cutoff,
+                check_rbac=False,
+                check_users=check_users,
             )
     return reports, cutoff
 
@@ -820,8 +905,11 @@ def build_report(
     days: int = 365,
     mode: str = "recent",
     check_rbac: bool = True,
+    check_users: bool = True,
 ) -> tuple[list[dict[str, Any]], str]:
-    reports, cutoff = build_reports(client, days, {mode: check_rbac})
+    reports, cutoff = build_reports(
+        client, days, {mode: check_rbac}, check_users=check_users
+    )
     return reports[mode], cutoff
 
 
@@ -1116,6 +1204,11 @@ def main() -> int:
         help="skip permission checks in single-report mode",
     )
     parser.add_argument(
+        "--no-users",
+        action="store_true",
+        help="skip user permission checks",
+    )
+    parser.add_argument(
         "--no-used-rbac",
         dest="used_rbac",
         action="store_false",
@@ -1147,6 +1240,7 @@ def main() -> int:
                 client,
                 args.days,
                 {mode: check_rbac for mode, (_, check_rbac) in settings.items()},
+                check_users=not args.no_users,
             )
             for report_mode, (directory_name, check_rbac) in settings.items():
                 directory = os.path.join(args.both_output_root, directory_name)
@@ -1166,7 +1260,11 @@ def main() -> int:
                 )
             return 0
         report, cutoff = build_report(
-            client, args.days, report_mode, check_rbac=not args.no_rbac
+            client,
+            args.days,
+            report_mode,
+            check_rbac=not args.no_rbac,
+            check_users=not args.no_users,
         )
         write_report(
             report,

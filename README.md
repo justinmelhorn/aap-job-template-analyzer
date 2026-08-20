@@ -50,6 +50,7 @@ AAP_REPORT_DAYS=365
 AAP_OUTPUT_ROOT=output
 AAP_USED_CHECK_RBAC=true
 AAP_UNUSED_CHECK_RBAC=false
+AAP_CHECK_USERS=true
 ```
 
 Run `./run-report.sh` after saving the file. Set `AAP_ENV_FILE=/path/to/file`
@@ -82,6 +83,8 @@ output/
 
 The used report checks RBAC by default. The unused report skips RBAC by default.
 Set `AAP_USED_CHECK_RBAC` or `AAP_UNUSED_CHECK_RBAC` to override either choice.
+Set `AAP_CHECK_USERS=false` to report team permissions only and skip all user,
+authenticator, and user-role-assignment API calls.
 The wrapper collects Job Templates, Workflow Templates, and workflow steps once,
 then divides that data into used and unused reports in memory. RBAC collections
 also run at most once, including when enabled for both reports.
@@ -89,7 +92,7 @@ The direct Python command remains available for individual reports; run it with
 `--help` for its options.
 
 API requests are deliberately low-impact: collections use pages of 100 and every
-request is delayed by half a second. Temporary HTTP failures are retried only twice,
+request is delayed by 0.25 seconds. Temporary HTTP failures are retried only twice,
 after at least 60 and 120 seconds. RBAC reports can therefore take several minutes
 in large environments; protecting AAP is prioritized over report speed. Each
 collection prints progress such as `Job templates: 100/200` using the count in
@@ -150,13 +153,14 @@ used, even when that branch did not run or the child has no `last_job_run` value
 Nested workflows and their children are followed recursively. Those children are
 therefore included in the used report and excluded from the unused report.
 Permissions are the current direct or owning-organization grants reported by
-AAP, not a reconstruction of permissions that were revoked in the past. On
-Gateway-based versions, only users with no authenticator association or with
-only Local or `legacy_password` authenticator associations are shown. Any user
-with an external authenticator is excluded. Controller users with LDAP or
-external-account markers are excluded;
-remaining users are cross-referenced by `ansible_id` and then username so local
-legacy Controller identities are retained.
+AAP, not a reconstruction of permissions that were revoked in the past. User
+authentication is always verified through Gateway, including when Controller
+4.6 supplies the RBAC assignments. Only users with at least one resolved
+Gateway authenticator association and only Local or `legacy_password` provider
+types are shown. Any external, mixed, or unassociated user is excluded;
+unassociated users produce one warning count on stderr. Controller users only
+enrich already-proven Gateway-local identities, matched by `ansible_id` and then
+unique username.
 
 The script supports the Controller 4.6-4.8 API layouts used by AAP 2.5-2.7.
 Controller 4.6 RBAC is read from Controller; later versions use Gateway RBAC.
