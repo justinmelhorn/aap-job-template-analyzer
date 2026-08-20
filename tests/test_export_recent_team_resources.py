@@ -154,29 +154,127 @@ class GatewayUserClient(FakeClient):
 
 
 class ExportTests(unittest.TestCase):
-    def test_client_retries_a_temporary_503(self):
+    def api_client(self):
         client = MODULE.Client.__new__(MODULE.Client)
         client.base_url = "https://aap.example.com"
         client.authorization = "Bearer test"
         client.context = None
-        unavailable = MODULE.urllib.error.HTTPError(
+        return client
+
+    def http_error(self, status, headers=None):
+        error = MODULE.urllib.error.HTTPError(
             "https://aap.example.com/api/controller/v2/users/",
-            503,
-            "Service Unavailable",
-            {},
-            None,
+            status,
+            "API error",
+            headers or {},
+            io.BytesIO(),
         )
+        self.addCleanup(error.close)
+        return error
+
+    def test_client_uses_small_pages_and_follows_next(self):
+        client = self.api_client()
+        next_url = (
+            "https://aap.example.com/api/controller/v2/users/"
+            "?page=2&page_size=50"
+        )
+        client.get = mock.Mock(
+            side_effect=[
+                {"results": [{"id": 1}], "next": next_url},
+                {"results": [{"id": 2}], "next": None},
+            ]
+        )
+
+        self.assertEqual([{"id": 1}, {"id": 2}], client.list("/users/"))
+        self.assertEqual(
+            [mock.call("/users/", {"page_size": 50}), mock.call(next_url)],
+            client.get.call_args_list,
+        )
+
+    def test_client_retries_temporary_errors_slowly(self):
+        client = self.api_client()
+        unavailable = self.http_error(503)
+
+        with mock.patch.object(
+            MODULE.urllib.request,
+            "urlopen",
+            side_effect=[unavailable, unavailable, io.BytesIO(b'{"results": []}')],
+        ) as urlopen, mock.patch.object(
+            MODULE.time, "sleep"
+        ) as sleep, mock.patch.object(
+            MODULE.sys, "stderr", new=io.StringIO()
+        ):
+            response = client.get("/api/controller/v2/users/")
+
+        self.assertEqual({"results": []}, response)
+        self.assertEqual(3, urlopen.call_count)
+        self.assertEqual(
+            [mock.call(1), mock.call(60), mock.call(120)], sleep.call_args_list
+        )
+
+    def test_client_honors_a_longer_retry_after(self):
+        client = self.api_client()
+        unavailable = self.http_error(503, {"Retry-After": "180"})
 
         with mock.patch.object(
             MODULE.urllib.request,
             "urlopen",
             side_effect=[unavailable, io.BytesIO(b'{"results": []}')],
-        ) as urlopen, mock.patch.object(MODULE.time, "sleep") as sleep:
-            response = client.get("/api/controller/v2/users/")
+        ), mock.patch.object(MODULE.time, "sleep") as sleep, mock.patch.object(
+            MODULE.sys, "stderr", new=io.StringIO()
+        ):
+            client.get("/api/controller/v2/users/")
 
-        self.assertEqual({"results": []}, response)
-        self.assertEqual(2, urlopen.call_count)
-        sleep.assert_called_once_with(1)
+        self.assertEqual([mock.call(1), mock.call(180)], sleep.call_args_list)
+
+    def test_client_stops_after_two_temporary_retries(self):
+        client = self.api_client()
+        unavailable = self.http_error(503)
+
+        with mock.patch.object(
+            MODULE.urllib.request,
+            "urlopen",
+            side_effect=[unavailable, unavailable, unavailable],
+        ) as urlopen, mock.patch.object(
+            MODULE.time, "sleep"
+        ) as sleep, mock.patch.object(
+            MODULE.sys, "stderr", new=io.StringIO()
+        ):
+            with self.assertRaises(MODULE.ExportError):
+                client.get("/api/controller/v2/users/")
+
+        self.assertEqual(3, urlopen.call_count)
+        self.assertEqual(
+            [mock.call(1), mock.call(60), mock.call(120)], sleep.call_args_list
+        )
+
+    def test_client_does_not_retry_permanent_http_errors(self):
+        client = self.api_client()
+
+        with mock.patch.object(
+            MODULE.urllib.request, "urlopen", side_effect=self.http_error(403)
+        ) as urlopen, mock.patch.object(
+            MODULE.time, "sleep"
+        ) as sleep:
+            with self.assertRaises(MODULE.ExportError):
+                client.get("/api/controller/v2/users/")
+
+        self.assertEqual(1, urlopen.call_count)
+        self.assertEqual([mock.call(1)], sleep.call_args_list)
+
+    def test_client_does_not_retry_connection_failures(self):
+        client = self.api_client()
+
+        with mock.patch.object(
+            MODULE.urllib.request,
+            "urlopen",
+            side_effect=MODULE.urllib.error.URLError("connection failed"),
+        ) as urlopen, mock.patch.object(MODULE.time, "sleep") as sleep:
+            with self.assertRaises(MODULE.ExportError):
+                client.get("/api/controller/v2/users/")
+
+        self.assertEqual(1, urlopen.call_count)
+        self.assertEqual([mock.call(1)], sleep.call_args_list)
 
     def test_recent_report_has_resources_teams_users_and_summary(self):
         report, _ = MODULE.build_report(FakeClient(), 365, "recent")

@@ -29,8 +29,10 @@ from standard_library_pdf import (
 CONTROLLER = "/api/controller/v2"
 GATEWAY = "/api/gateway/v1"
 TITLE = "AAP Job Template Report"
+PAGE_SIZE = 50
+REQUEST_DELAY = 1
 RETRYABLE_HTTP_ERRORS = {429, 502, 503, 504}
-RETRY_DELAYS = (1, 2, 4)
+RETRY_DELAYS = (60, 120)
 
 
 class ExportError(RuntimeError):
@@ -65,7 +67,9 @@ class Client:
             url,
             headers={"Accept": "application/json", "Authorization": self.authorization},
         )
+        delay = REQUEST_DELAY
         for attempt in range(len(RETRY_DELAYS) + 1):
+            time.sleep(delay)
             try:
                 with urllib.request.urlopen(
                     request, context=self.context, timeout=60
@@ -82,14 +86,13 @@ class Client:
                     f"GET {url} returned HTTP {exc.code}; retrying in {delay}s",
                     file=sys.stderr,
                 )
-                time.sleep(delay)
             except urllib.error.URLError as exc:
                 raise ExportError(f"GET {url} failed: {exc.reason}") from exc
 
         raise AssertionError("unreachable")
 
     def list(self, path: str, **params: Any) -> list[dict[str, Any]]:
-        params["page_size"] = 200
+        params["page_size"] = PAGE_SIZE
         page = self.get(path, params)
         results = list(page.get("results", []))
         while page.get("next"):

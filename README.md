@@ -80,6 +80,11 @@ Set `AAP_USED_CHECK_RBAC` or `AAP_UNUSED_CHECK_RBAC` to override either choice.
 The direct Python command remains available for individual reports; run it with
 `--help` for its options.
 
+API requests are deliberately low-impact: collections use pages of 50 and every
+request is delayed by one second. Temporary HTTP failures are retried only twice,
+after at least 60 and 120 seconds. RBAC reports can therefore take several minutes
+in large environments; protecting AAP is prioritized over report speed.
+
 ## Output
 
 The PDF overview counts unique inventories and credentials, even when several
