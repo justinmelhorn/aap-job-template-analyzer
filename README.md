@@ -1,11 +1,12 @@
-# AAP Job Template Report
+# AAP Job and Workflow Template Report
 
 A small, read-only Python script that reports:
 
-- Job Templates and their AAP URLs
+- Job and Workflow Templates and their AAP URLs
 - attached inventories and credentials (names and URLs only)
+- configured workflow steps and their success, failure, and always paths
 - teams and users with current view, execute, or admin permission
-- recently used, unused, or all Job Templates
+- recently used, unused, or all templates
 
 It writes simple YAML and, optionally, a dependency-free PDF. The PDF starts
 with an overview and the consolidated name/URL summary. It never exports
@@ -88,14 +89,17 @@ in large environments; protecting AAP is prioritized over report speed.
 ## Output
 
 The PDF overview counts unique inventories and credentials, even when several
-templates use the same resource. YAML URLs are Controller API endpoints; the
-PDF keeps human-facing AAP UI URLs. The YAML summary is deliberately first and
+templates use the same resource. Names in the PDF summary link to their detail
+sections later in the report. YAML URLs are Controller API endpoints; the PDF
+keeps human-facing AAP UI URLs. The YAML summary is deliberately first and
 contains only each matching name and URL:
 
 ```yaml
 summary:
   - name: "Deploy Payments"
     url: "https://aap.example.com/api/controller/v2/job_templates/24/"
+  - name: "Release Payments"
+    url: "https://aap.example.com/api/controller/v2/workflow_job_templates/8/"
 
 job_templates:
   - name: "Deploy Payments"
@@ -115,9 +119,27 @@ job_templates:
       - type: "user"
         name: "alice"
         level: "admin"
+
+workflow_job_templates:
+  - name: "Release Payments"
+    url: "https://aap.example.com/api/controller/v2/workflow_job_templates/8/"
+    last_run: "2026-08-12T15:21:00Z"
+    inventory: null
+    steps:
+      - identifier: "deploy"
+        name: "Deploy Payments"
+        type: "job_template"
+        url: "https://aap.example.com/api/controller/v2/job_templates/24/"
+        success: []
+        failure: []
+        always: []
 ```
 
-The report uses `last_job_run`; it does not depend on retained job history.
+The report uses `last_job_run`; it does not depend on retained job history. A
+workflow used during the report period makes every configured child Job Template
+used, even when that branch did not run or the child has no `last_job_run` value.
+Nested workflows and their children are followed recursively. Those children are
+therefore included in the used report and excluded from the unused report.
 Permissions are the current direct or owning-organization grants reported by
 AAP, not a reconstruction of permissions that were revoked in the past. On
 Gateway-based versions, users are cross-referenced with Controller users by

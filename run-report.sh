@@ -64,7 +64,7 @@ if [[ ${#python_launcher[@]} -eq 0 ]]; then
   exit 1
 fi
 
-printf 'AAP Job Template Report\n\n'
+printf 'AAP Job and Workflow Template Report\n\n'
 printf 'Python launcher: %s\n\n' "${python_label}"
 if [[ -z "${AAP_URL:-}" ]]; then
   read -r -p 'AAP Platform Gateway URL: ' AAP_URL
@@ -149,11 +149,11 @@ run_report() {
 }
 
 set +e
-printf 'Running used Job Template report...\n'
+printf 'Running used template report...\n'
 run_report used "${used_check_rbac}" "${used_directory}"
 used_status=$?
 
-printf '\nRunning unused Job Template report...\n'
+printf '\nRunning unused template report...\n'
 run_report unused "${unused_check_rbac}" "${unused_directory}"
 unused_status=$?
 set -e

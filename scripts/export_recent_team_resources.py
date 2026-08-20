@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export AAP Job Templates, tied resources, and current permissions."""
+"""Export AAP Job and Workflow Templates, resources, and permissions."""
 from __future__ import annotations
 
 import argparse
@@ -28,11 +28,21 @@ from standard_library_pdf import (
 
 CONTROLLER = "/api/controller/v2"
 GATEWAY = "/api/gateway/v1"
-TITLE = "AAP Job Template Report"
+TITLE = "AAP Template Report"
 PAGE_SIZE = 50
 REQUEST_DELAY = 1
 RETRYABLE_HTTP_ERRORS = {429, 502, 503, 504}
 RETRY_DELAYS = (60, 120)
+STEP_KINDS = {
+    "job": "job_template",
+    "job_template": "job_template",
+    "workflow_job": "workflow_job_template",
+    "workflow_job_template": "workflow_job_template",
+    "project_update": "project",
+    "inventory_update": "inventory_source",
+    "workflow_approval": "workflow_approval",
+    "workflow_approval_template": "workflow_approval",
+}
 
 
 class ExportError(RuntimeError):
@@ -111,6 +121,8 @@ def ui_url(client: Client, kind: str, item: dict[str, Any]) -> str:
     item_id = item["id"]
     if kind == "job_template":
         path = f"/execution/templates/job-template/{item_id}/details"
+    elif kind == "workflow_job_template":
+        path = f"/execution/templates/workflow-job-template/{item_id}/visualizer"
     elif kind == "credential":
         path = f"/execution/credentials/{item_id}/details"
     else:
@@ -125,6 +137,7 @@ def ui_url(client: Client, kind: str, item: dict[str, Any]) -> str:
 def api_url(client: Client, kind: str, item: dict[str, Any]) -> str:
     endpoint = {
         "job_template": "job_templates",
+        "workflow_job_template": "workflow_job_templates",
         "inventory": "inventories",
         "credential": "credentials",
     }[kind]
@@ -146,11 +159,19 @@ def resource(client: Client, kind: str, item: Any) -> Optional[dict[str, str]]:
 
 def permission_level(permissions: list[str]) -> Optional[str]:
     values = set(permissions)
-    if values & {"awx.change_jobtemplate", "awx.delete_jobtemplate"}:
+    if values & {
+        "awx.change_jobtemplate",
+        "awx.delete_jobtemplate",
+        "awx.change_workflowjobtemplate",
+        "awx.delete_workflowjobtemplate",
+    }:
         return "admin"
-    if "awx.execute_jobtemplate" in values:
+    if values & {
+        "awx.execute_jobtemplate",
+        "awx.execute_workflowjobtemplate",
+    }:
         return "execute"
-    if "awx.view_jobtemplate" in values:
+    if values & {"awx.view_jobtemplate", "awx.view_workflowjobtemplate"}:
         return "view"
     return None
 
@@ -196,19 +217,74 @@ def rbac_base(client: Client) -> str:
     return CONTROLLER if (major, minor) == (4, 6) else GATEWAY
 
 
-def selected(template: dict[str, Any], cutoff: str, mode: str) -> bool:
+def ran_recently(template: dict[str, Any], cutoff: str) -> bool:
     last_run = template.get("last_job_run")
-    if mode == "all":
-        return True
-    if mode == "unused":
-        return not last_run or str(last_run) < cutoff
     return bool(last_run and str(last_run) >= cutoff)
+
+
+def node_link(node: dict[str, Any]) -> tuple[str, str]:
+    summary = node.get("summary_fields", {}).get("unified_job_template", {})
+    if not isinstance(summary, dict):
+        summary = {}
+    raw_kind = str(summary.get("type") or summary.get("unified_job_type") or "")
+    kind = STEP_KINDS.get(raw_kind, raw_kind)
+    if not kind:
+        path = str(node.get("related", {}).get("unified_job_template") or "")
+        for endpoint, endpoint_kind in (
+            ("/workflow_job_templates/", "workflow_job_template"),
+            ("/job_templates/", "job_template"),
+            ("/projects/", "project"),
+            ("/inventory_sources/", "inventory_source"),
+            ("/workflow_approval_templates/", "workflow_approval"),
+        ):
+            if endpoint in path:
+                kind = endpoint_kind
+                break
+    return kind or "unknown", key(
+        node.get("unified_job_template") or summary.get("id")
+    )
+
+
+def used_template_ids(
+    jobs: list[dict[str, Any]],
+    workflows: list[dict[str, Any]],
+    nodes: list[dict[str, Any]],
+    cutoff: str,
+) -> tuple[set[str], set[str]]:
+    used_jobs = {
+        key(item["id"]) for item in jobs if ran_recently(item, cutoff)
+    }
+    used_workflows = {
+        key(item["id"]) for item in workflows if ran_recently(item, cutoff)
+    }
+    nodes_by_workflow: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for node in nodes:
+        nodes_by_workflow[key(node.get("workflow_job_template"))].append(node)
+
+    pending = list(used_workflows)
+    visited: set[str] = set()
+    while pending:
+        workflow_id = pending.pop()
+        if workflow_id in visited:
+            continue
+        visited.add(workflow_id)
+        for node in nodes_by_workflow.get(workflow_id, []):
+            kind, template_id = node_link(node)
+            if kind == "job_template" and template_id:
+                used_jobs.add(template_id)
+            elif kind == "workflow_job_template" and template_id:
+                if template_id not in used_workflows:
+                    used_workflows.add(template_id)
+                pending.append(template_id)
+    return used_jobs, used_workflows
 
 
 def job_entries(
     client: Client,
     templates: list[dict[str, Any]],
-    access: Optional[dict[str, dict[tuple[str, str], dict[str, str]]]] = None,
+    access: Optional[
+        dict[tuple[str, str], dict[tuple[str, str], dict[str, str]]]
+    ] = None,
 ) -> list[dict[str, Any]]:
     report = []
     for template in templates:
@@ -220,6 +296,8 @@ def job_entries(
             if credential:
                 credentials.append(credential)
         entry: dict[str, Any] = {
+            "kind": "job_template",
+            "pdf_anchor": f"job-template-{template['id']}",
             "name": str(template["name"]),
             "url": api_url(client, "job_template", template),
             "ui_url": ui_url(client, "job_template", template),
@@ -236,7 +314,99 @@ def job_entries(
         }
         if access is not None:
             entry["permissions"] = sorted(
-                access[key(template["id"])].values(),
+                access[("job_template", key(template["id"]))].values(),
+                key=lambda item: (item["type"], item["name"].casefold()),
+            )
+        report.append(entry)
+    return sorted(report, key=lambda item: item["name"].casefold())
+
+
+def workflow_entries(
+    client: Client,
+    workflows: list[dict[str, Any]],
+    nodes: list[dict[str, Any]],
+    access: Optional[
+        dict[tuple[str, str], dict[tuple[str, str], dict[str, str]]]
+    ] = None,
+) -> list[dict[str, Any]]:
+    nodes_by_workflow: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for node in nodes:
+        nodes_by_workflow[key(node.get("workflow_job_template"))].append(node)
+
+    report = []
+    for workflow in workflows:
+        workflow_nodes = nodes_by_workflow.get(key(workflow["id"]), [])
+        identifiers = {
+            key(node["id"]): str(node.get("identifier") or f"Node {node['id']}")
+            for node in workflow_nodes
+        }
+        steps = []
+        for node in workflow_nodes:
+            summary = node.get("summary_fields", {}).get("unified_job_template", {})
+            if not isinstance(summary, dict):
+                summary = {}
+            kind, template_id = node_link(node)
+            path = node.get("related", {}).get("unified_job_template") or summary.get(
+                "url"
+            )
+            url = None
+            if path:
+                url = (
+                    str(path)
+                    if str(path).startswith(("http://", "https://"))
+                    else client.base_url + "/" + str(path).lstrip("/")
+                )
+            elif template_id and kind in {"job_template", "workflow_job_template"}:
+                url = api_url(client, kind, {"id": template_id})
+            ui = url
+            if template_id and kind in {"job_template", "workflow_job_template"}:
+                ui = ui_url(client, kind, {"id": template_id})
+
+            def branches(name: str) -> list[str]:
+                return [
+                    identifiers.get(key(item), key(item))
+                    for item in node.get(name, [])
+                ]
+
+            steps.append(
+                {
+                    "identifier": str(
+                        node.get("identifier") or f"Node {node['id']}"
+                    ),
+                    "name": str(
+                        summary.get("name")
+                        or node.get("identifier")
+                        or f"Node {node['id']}"
+                    ),
+                    "type": kind,
+                    "url": url,
+                    "ui_url": ui,
+                    "success": branches("success_nodes"),
+                    "failure": branches("failure_nodes"),
+                    "always": branches("always_nodes"),
+                }
+            )
+
+        summary = workflow.get("summary_fields", {})
+        entry: dict[str, Any] = {
+            "kind": "workflow_job_template",
+            "pdf_anchor": f"workflow-template-{workflow['id']}",
+            "name": str(workflow["name"]),
+            "url": api_url(client, "workflow_job_template", workflow),
+            "ui_url": ui_url(client, "workflow_job_template", workflow),
+            "last_run": (
+                str(workflow["last_job_run"])
+                if workflow.get("last_job_run")
+                else None
+            ),
+            "inventory": resource(client, "inventory", summary.get("inventory")),
+            "credentials": [],
+            "steps": steps,
+            "permissions_checked": access is not None,
+        }
+        if access is not None:
+            entry["permissions"] = sorted(
+                access[("workflow_job_template", key(workflow["id"]))].values(),
                 key=lambda item: (item["type"], item["name"].casefold()),
             )
         report.append(entry)
@@ -252,23 +422,74 @@ def build_report(
     cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat(
         timespec="seconds"
     ).replace("+00:00", "Z")
-    templates = [
-        item
-        for item in client.list(f"{CONTROLLER}/job_templates/", order_by="name")
-        if selected(item, cutoff, mode)
-    ]
-    if not check_rbac:
-        return job_entries(client, templates), cutoff
+    all_jobs = client.list(f"{CONTROLLER}/job_templates/", order_by="name")
+    all_workflows = client.list(
+        f"{CONTROLLER}/workflow_job_templates/", order_by="name"
+    )
+    all_nodes = (
+        client.list(f"{CONTROLLER}/workflow_job_template_nodes/", order_by="id")
+        if all_workflows
+        else []
+    )
+    used_jobs, used_workflows = used_template_ids(
+        all_jobs, all_workflows, all_nodes, cutoff
+    )
 
-    templates_by_id = {key(item["id"]): item for item in templates}
+    def included(kind: str, item: dict[str, Any]) -> bool:
+        if mode == "all":
+            return True
+        used_ids = used_jobs if kind == "job_template" else used_workflows
+        is_used = key(item["id"]) in used_ids
+        return is_used if mode == "recent" else not is_used
+
+    jobs = [item for item in all_jobs if included("job_template", item)]
+    workflows = [
+        item for item in all_workflows if included("workflow_job_template", item)
+    ]
+    workflow_ids = {key(item["id"]) for item in workflows}
+    nodes = [
+        item
+        for item in all_nodes
+        if key(item.get("workflow_job_template")) in workflow_ids
+    ]
+
+    def entries(
+        access: Optional[
+            dict[tuple[str, str], dict[tuple[str, str], dict[str, str]]]
+        ] = None,
+    ) -> list[dict[str, Any]]:
+        return sorted(
+            job_entries(client, jobs, access)
+            + workflow_entries(client, workflows, nodes, access),
+            key=lambda item: (item["name"].casefold(), item["kind"]),
+        )
+
+    if not check_rbac:
+        return entries(), cutoff
+
+    templates = {
+        "job_template": jobs,
+        "workflow_job_template": workflows,
+    }
+    templates_by_id = {
+        kind: {key(item["id"]): item for item in items}
+        for kind, items in templates.items()
+    }
     templates_by_ansible_id = {
-        key(
-            item.get("ansible_id")
-            or item.get("summary_fields", {}).get("resource", {}).get("ansible_id")
-        ): item
-        for item in templates
-        if item.get("ansible_id")
-        or item.get("summary_fields", {}).get("resource", {}).get("ansible_id")
+        kind: {
+            key(
+                item.get("ansible_id")
+                or item.get("summary_fields", {})
+                .get("resource", {})
+                .get("ansible_id")
+            ): item
+            for item in items
+            if item.get("ansible_id")
+            or item.get("summary_fields", {})
+            .get("resource", {})
+            .get("ansible_id")
+        }
+        for kind, items in templates.items()
     }
 
     base = rbac_base(client)
@@ -295,19 +516,29 @@ def build_report(
         key(item["id"]): item for item in client.list(f"{base}/role_definitions/")
     }
 
-    templates_by_org: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for template in templates:
-        organization = template.get("summary_fields", {}).get("organization", {})
-        organization_name = organization.get("name")
-        if not organization_name:
-            organization_name = organizations.get(key(template.get("organization")))
-        if organization_name:
-            templates_by_org[str(organization_name)].append(template)
+    templates_by_org: dict[
+        str, list[tuple[str, dict[str, Any]]]
+    ] = defaultdict(list)
+    for kind, items in templates.items():
+        for template in items:
+            organization = template.get("summary_fields", {}).get(
+                "organization", {}
+            )
+            organization_name = organization.get("name")
+            if not organization_name:
+                organization_name = organizations.get(
+                    key(template.get("organization"))
+                )
+            if organization_name:
+                templates_by_org[str(organization_name)].append((kind, template))
 
     rank = {"view": 1, "execute": 2, "admin": 3}
-    access: dict[str, dict[tuple[str, str], dict[str, str]]] = defaultdict(dict)
+    access: dict[
+        tuple[str, str], dict[tuple[str, str], dict[str, str]]
+    ] = defaultdict(dict)
 
     def add(
+        kind: str,
         template: dict[str, Any],
         principal_type: str,
         principal_id: str,
@@ -321,9 +552,10 @@ def build_report(
         if principal_type == "team" and organization:
             entry["organization"] = organization
         identity = (principal_type, principal_id)
-        current = access[key(template["id"])].get(identity)
+        template_identity = (kind, key(template["id"]))
+        current = access[template_identity].get(identity)
         if current is None or rank[level] > rank[current["level"]]:
-            access[key(template["id"])][identity] = entry
+            access[template_identity][identity] = entry
 
     for identity, records in user_records.items():
         if any(
@@ -338,9 +570,14 @@ def build_report(
             level = "view"
         else:
             continue
-        for template in templates:
-            add(template, "user", identity, level)
+        for kind, items in templates.items():
+            for template in items:
+                add(kind, template, "user", identity, level)
 
+    content_types = {
+        "awx.jobtemplate": "job_template",
+        "awx.workflowjobtemplate": "workflow_job_template",
+    }
     for principal_type in ("team", "user"):
         assignments = client.list(f"{base}/role_{principal_type}_assignments/")
         for assignment in assignments:
@@ -358,13 +595,16 @@ def build_report(
                 or definition.get("content_type")
                 or ""
             )
-            if content_type == "awx.jobtemplate":
-                template = templates_by_id.get(key(assignment.get("object_id")))
-                template = template or templates_by_ansible_id.get(
+            kind = content_types.get(content_type)
+            if kind:
+                template = templates_by_id[kind].get(
+                    key(assignment.get("object_id"))
+                )
+                template = template or templates_by_ansible_id[kind].get(
                     key(assignment.get("object_ansible_id"))
                 )
                 if template:
-                    add(template, principal_type, principal_id, level)
+                    add(kind, template, principal_type, principal_id, level)
             elif content_type == "shared.organization":
                 organization_name = organizations.get(key(assignment.get("object_id")))
                 if not organization_name:
@@ -373,10 +613,12 @@ def build_report(
                         .get("content_object", {})
                         .get("name")
                     )
-                for template in templates_by_org.get(str(organization_name), []):
-                    add(template, principal_type, principal_id, level)
+                for kind, template in templates_by_org.get(
+                    str(organization_name), []
+                ):
+                    add(kind, template, principal_type, principal_id, level)
 
-    return job_entries(client, templates, access), cutoff
+    return entries(access), cutoff
 
 
 def scalar(value: Optional[str]) -> str:
@@ -385,43 +627,34 @@ def scalar(value: Optional[str]) -> str:
 
 def render_yaml(report: list[dict[str, Any]]) -> str:
     lines = ["summary:" + ("" if report else " []")]
-    for job in report:
-        lines.extend(
-            [f"  - name: {scalar(job['name'])}", f"    url: {scalar(job['url'])}"]
-        )
-
-    lines.append("job_templates:" + ("" if report else " []"))
-    for job in report:
+    for template in report:
         lines.extend(
             [
-                f"  - name: {scalar(job['name'])}",
-                f"    url: {scalar(job['url'])}",
-                f"    last_run: {scalar(job['last_run'])}",
+                f"  - name: {scalar(template['name'])}",
+                f"    url: {scalar(template['url'])}",
             ]
         )
-        if job["inventory"]:
+
+    def add_inventory(template: dict[str, Any]) -> None:
+        if template["inventory"]:
             lines.extend(
                 [
                     "    inventory:",
-                    f"      name: {scalar(job['inventory']['name'])}",
-                    f"      url: {scalar(job['inventory']['url'])}",
+                    f"      name: {scalar(template['inventory']['name'])}",
+                    f"      url: {scalar(template['inventory']['url'])}",
                 ]
             )
         else:
             lines.append("    inventory: null")
-        lines.append("    credentials:" + ("" if job["credentials"] else " []"))
-        for credential in job["credentials"]:
-            lines.extend(
-                [
-                    f"      - name: {scalar(credential['name'])}",
-                    f"        url: {scalar(credential['url'])}",
-                ]
-            )
-        if not job["permissions_checked"]:
+
+    def add_permissions(template: dict[str, Any]) -> None:
+        if not template["permissions_checked"]:
             lines.append("    permissions_checked: false")
-            continue
-        lines.append("    permissions:" + ("" if job["permissions"] else " []"))
-        for permission in job["permissions"]:
+            return
+        lines.append(
+            "    permissions:" + ("" if template["permissions"] else " []")
+        )
+        for permission in template["permissions"]:
             lines.extend(
                 [
                     f"      - type: {scalar(permission['type'])}",
@@ -433,6 +666,57 @@ def render_yaml(report: list[dict[str, Any]]) -> str:
                     f"        organization: {scalar(permission['organization'])}"
                 )
             lines.append(f"        level: {scalar(permission['level'])}")
+
+    jobs = [item for item in report if item["kind"] == "job_template"]
+    workflows = [
+        item for item in report if item["kind"] == "workflow_job_template"
+    ]
+    lines.append("job_templates:" + ("" if jobs else " []"))
+    for job in jobs:
+        lines.extend(
+            [
+                f"  - name: {scalar(job['name'])}",
+                f"    url: {scalar(job['url'])}",
+                f"    last_run: {scalar(job['last_run'])}",
+            ]
+        )
+        add_inventory(job)
+        lines.append("    credentials:" + ("" if job["credentials"] else " []"))
+        for credential in job["credentials"]:
+            lines.extend(
+                [
+                    f"      - name: {scalar(credential['name'])}",
+                    f"        url: {scalar(credential['url'])}",
+                ]
+            )
+        add_permissions(job)
+
+    lines.append("workflow_job_templates:" + ("" if workflows else " []"))
+    for workflow in workflows:
+        lines.extend(
+            [
+                f"  - name: {scalar(workflow['name'])}",
+                f"    url: {scalar(workflow['url'])}",
+                f"    last_run: {scalar(workflow['last_run'])}",
+            ]
+        )
+        add_inventory(workflow)
+        lines.append("    steps:" + ("" if workflow["steps"] else " []"))
+        for step in workflow["steps"]:
+            lines.extend(
+                [
+                    f"      - identifier: {scalar(step['identifier'])}",
+                    f"        name: {scalar(step['name'])}",
+                    f"        type: {scalar(step['type'])}",
+                    f"        url: {scalar(step['url'])}",
+                ]
+            )
+            for branch in ("success", "failure", "always"):
+                targets = step[branch]
+                lines.append(f"        {branch}:" + ("" if targets else " []"))
+                for target in targets:
+                    lines.append(f"          - {scalar(target)}")
+        add_permissions(workflow)
     return "\n".join(lines) + "\n"
 
 
@@ -467,15 +751,21 @@ def render_pdf(
     document = StandardLibraryPdf()
     page_heading(document, TITLE)
     scope = {
-        "recent": f"Run within the last {days} days",
-        "unused": f"Not run within the last {days} days; never-run jobs included",
-        "all": "All Job Templates; no date filter",
+        "recent": f"Used directly or by a workflow within the last {days} days",
+        "unused": f"Not used directly or by a workflow within the last {days} days",
+        "all": "All templates; no date filter",
     }[mode]
     inventory_count, credential_count = unique_resource_counts(report)
+    jobs = [item for item in report if item["kind"] == "job_template"]
+    workflows = [
+        item for item in report if item["kind"] == "workflow_job_template"
+    ]
     overview = [
         ["Scope", scope],
         ["Cutoff", cutoff if mode != "all" else "Not applied"],
-        ["Job Templates", len(report)],
+        ["Job Templates", len(jobs)],
+        ["Workflow Templates", len(workflows)],
+        ["Workflow Steps", sum(len(item["steps"]) for item in workflows)],
         ["Unique inventories", inventory_count],
         ["Unique credentials", credential_count],
         ["RBAC permissions", "Checked" if rbac_checked else "Not checked"],
@@ -492,41 +782,73 @@ def render_pdf(
         document,
         TITLE,
         "Summary",
-        ["Job Template", "URL"],
-        [[job["name"], job["ui_url"]] for job in report],
+        ["Template (click for details)", "URL"],
+        [[template["name"], template["ui_url"]] for template in report],
         [250, 470],
+        row_links=[template["pdf_anchor"] for template in report],
     )
 
-    for job in report:
+    for template in report:
         if document.y < 150:
             document.new_page()
             page_heading(document, TITLE, "Details - continued")
-        add_text(document, job["name"], True)
-        add_text(document, f"URL: {job['ui_url']}")
-        add_text(document, f"Last run: {job['last_run'] or 'Never'}")
-        inventory = job["inventory"]
+        document.destination(template["pdf_anchor"])
+        kind = (
+            "Workflow Template"
+            if template["kind"] == "workflow_job_template"
+            else "Job Template"
+        )
+        add_text(document, template["name"], True)
+        add_text(document, f"Type: {kind}")
+        add_text(document, f"URL: {template['ui_url']}")
+        add_text(document, f"Last run: {template['last_run'] or 'Never'}")
+        inventory = template["inventory"]
         add_text(
             document,
             "Inventory: none"
             if not inventory
             else f"Inventory: {inventory['name']} - {inventory['ui_url']}",
         )
-        credentials = job["credentials"]
-        add_text(
-            document,
-            "Credentials: none"
-            if not credentials
-            else "Credentials: "
-            + "; ".join(
-                f"{item['name']} - {item['ui_url']}" for item in credentials
-            ),
-        )
-        if not job["permissions_checked"]:
+        if template["kind"] == "job_template":
+            credentials = template["credentials"]
+            add_text(
+                document,
+                "Credentials: none"
+                if not credentials
+                else "Credentials: "
+                + "; ".join(
+                    f"{item['name']} - {item['ui_url']}" for item in credentials
+                ),
+            )
+        else:
+            step_rows = []
+            for step in template["steps"]:
+                paths = []
+                for branch in ("success", "failure", "always"):
+                    if step[branch]:
+                        paths.append(f"{branch}: {', '.join(step[branch])}")
+                step_rows.append(
+                    [
+                        f"{step['identifier']}: {step['name']}",
+                        step["type"].replace("_", " ").title(),
+                        step["ui_url"] or "",
+                        "; ".join(paths) or "End",
+                    ]
+                )
+            table(
+                document,
+                TITLE,
+                "Steps",
+                ["Step", "Type", "URL", "Next"],
+                step_rows,
+                [180, 110, 280, 150],
+            )
+        if not template["permissions_checked"]:
             add_text(document, "Permissions: not checked")
             document.y -= 12
             continue
         permission_rows = []
-        for permission in job["permissions"]:
+        for permission in template["permissions"]:
             name = permission["name"]
             if permission.get("organization"):
                 name += f" ({permission['organization']})"

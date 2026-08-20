@@ -64,6 +64,7 @@ class FakeClient:
                     },
                 },
             ],
+            "/api/controller/v2/workflow_job_templates/": [],
             "/api/controller/v2/organizations/": [{"id": 1, "name": "Payments"}],
             "/api/controller/v2/teams/": [
                 {"id": 100, "name": "Operators", "organization": 1}
@@ -150,6 +151,168 @@ class GatewayUserClient(FakeClient):
         }
         if path in gateway:
             return gateway[path]
+        return super().list(path, **params)
+
+
+class WorkflowClient(FakeClient):
+    def __init__(self):
+        self.paths = []
+
+    def list(self, path, **params):
+        self.paths.append(path)
+        if path == "/api/controller/v2/job_templates/":
+            return super().list(path, **params) + [
+                {
+                    "id": 13,
+                    "name": "Truly Unused",
+                    "last_job_run": "2020-01-01T12:00:00Z",
+                    "summary_fields": {
+                        "organization": {"id": 1, "name": "Payments"}
+                    },
+                }
+            ]
+        if path == "/api/controller/v2/workflow_job_templates/":
+            return [
+                {
+                    "id": 40,
+                    "name": "Release Workflow",
+                    "last_job_run": "2026-08-02T12:00:00Z",
+                    "summary_fields": {
+                        "organization": {"id": 1, "name": "Payments"},
+                        "inventory": {"id": 20, "name": "Production"},
+                    },
+                },
+                {
+                    "id": 41,
+                    "name": "Nested Workflow",
+                    "last_job_run": None,
+                    "summary_fields": {
+                        "organization": {"id": 1, "name": "Payments"}
+                    },
+                },
+                {
+                    "id": 42,
+                    "name": "Dormant Workflow",
+                    "last_job_run": "2020-01-01T12:00:00Z",
+                    "summary_fields": {
+                        "organization": {"id": 1, "name": "Payments"}
+                    },
+                },
+            ]
+        if path == "/api/controller/v2/workflow_job_template_nodes/":
+            return [
+                {
+                    "id": 50,
+                    "identifier": "never-run-branch",
+                    "workflow_job_template": 40,
+                    "unified_job_template": 12,
+                    "success_nodes": [51],
+                    "failure_nodes": [],
+                    "always_nodes": [],
+                    "related": {
+                        "unified_job_template": "/api/controller/v2/job_templates/12/"
+                    },
+                    "summary_fields": {
+                        "unified_job_template": {
+                            "id": 12,
+                            "name": "Never Run",
+                        }
+                    },
+                },
+                {
+                    "id": 51,
+                    "identifier": "nested-workflow",
+                    "workflow_job_template": 40,
+                    "unified_job_template": 41,
+                    "success_nodes": [],
+                    "failure_nodes": [54],
+                    "always_nodes": [],
+                    "related": {
+                        "unified_job_template": "/api/controller/v2/workflow_job_templates/41/"
+                    },
+                    "summary_fields": {
+                        "unified_job_template": {
+                            "id": 41,
+                            "name": "Nested Workflow",
+                            "unified_job_type": "workflow_job",
+                        }
+                    },
+                },
+                {
+                    "id": 52,
+                    "identifier": "old-audit",
+                    "workflow_job_template": 41,
+                    "unified_job_template": 11,
+                    "success_nodes": [],
+                    "failure_nodes": [],
+                    "always_nodes": [],
+                    "related": {
+                        "unified_job_template": "/api/controller/v2/job_templates/11/"
+                    },
+                    "summary_fields": {
+                        "unified_job_template": {
+                            "id": 11,
+                            "name": "Old Audit",
+                            "unified_job_type": "job",
+                        }
+                    },
+                },
+                {
+                    "id": 53,
+                    "identifier": "dormant-step",
+                    "workflow_job_template": 42,
+                    "unified_job_template": 13,
+                    "success_nodes": [],
+                    "failure_nodes": [],
+                    "always_nodes": [],
+                    "related": {
+                        "unified_job_template": "/api/controller/v2/job_templates/13/"
+                    },
+                    "summary_fields": {
+                        "unified_job_template": {
+                            "id": 13,
+                            "name": "Truly Unused",
+                            "unified_job_type": "job",
+                        }
+                    },
+                },
+                {
+                    "id": 54,
+                    "identifier": "approval",
+                    "workflow_job_template": 40,
+                    "unified_job_template": 60,
+                    "success_nodes": [],
+                    "failure_nodes": [],
+                    "always_nodes": [],
+                    "related": {
+                        "unified_job_template": "/api/controller/v2/workflow_approval_templates/60/"
+                    },
+                    "summary_fields": {
+                        "unified_job_template": {
+                            "id": 60,
+                            "name": "Approve Release",
+                            "unified_job_type": "workflow_approval",
+                        }
+                    },
+                },
+            ]
+        if path == "/api/controller/v2/role_definitions/":
+            return super().list(path, **params) + [
+                {
+                    "id": 3,
+                    "content_type": "awx.workflowjobtemplate",
+                    "permissions": ["awx.execute_workflowjobtemplate"],
+                }
+            ]
+        if path == "/api/controller/v2/role_team_assignments/":
+            return super().list(path, **params) + [
+                {
+                    "team": 100,
+                    "role_definition": 3,
+                    "object_id": 40,
+                    "content_type": "awx.workflowjobtemplate",
+                }
+            ]
         return super().list(path, **params)
 
 
@@ -320,6 +483,83 @@ class ExportTests(unittest.TestCase):
             report, 365, "2025-08-19T00:00:00Z", "recent", rbac_checked=True
         )
         self.assertIn(b"/execution/templates/job-template/10/details", pdf)
+        self.assertEqual(1, pdf.count(b"/Subtype /Link"))
+        self.assertEqual(1, pdf.count(b"/Dest ["))
+
+    def test_recent_workflow_marks_all_nested_children_used(self):
+        client = WorkflowClient()
+        report, _ = MODULE.build_report(client, 365, "recent")
+        jobs = {
+            item["name"]: item
+            for item in report
+            if item["kind"] == "job_template"
+        }
+        workflows = {
+            item["name"]: item
+            for item in report
+            if item["kind"] == "workflow_job_template"
+        }
+
+        self.assertEqual({"Deploy", "Never Run", "Old Audit"}, set(jobs))
+        self.assertIsNone(jobs["Never Run"]["last_run"])
+        self.assertEqual(
+            {"Nested Workflow", "Release Workflow"}, set(workflows)
+        )
+        self.assertIsNone(workflows["Nested Workflow"]["last_run"])
+        release_steps = {
+            item["identifier"]: item for item in workflows["Release Workflow"]["steps"]
+        }
+        self.assertEqual("Never Run", release_steps["never-run-branch"]["name"])
+        self.assertEqual(
+            ["nested-workflow"], release_steps["never-run-branch"]["success"]
+        )
+        self.assertEqual("workflow_approval", release_steps["approval"]["type"])
+        self.assertIn(
+            {
+                "type": "team",
+                "name": "Operators",
+                "organization": "Payments",
+                "level": "execute",
+            },
+            workflows["Release Workflow"]["permissions"],
+        )
+        self.assertEqual(
+            1,
+            client.paths.count(
+                "/api/controller/v2/workflow_job_template_nodes/"
+            ),
+        )
+        self.assertFalse(
+            any("/workflow_nodes/" in path for path in client.paths),
+            client.paths,
+        )
+
+        output = MODULE.render_yaml(report)
+        self.assertIn("\nworkflow_job_templates:\n", output)
+        self.assertIn('identifier: "never-run-branch"', output)
+        self.assertIn('name: "Approve Release"', output)
+        pdf = MODULE.render_pdf(
+            report, 365, "2025-08-19T00:00:00Z", "recent", rbac_checked=True
+        )
+        self.assertIn(b"Workflow Templates", pdf)
+        self.assertIn(b"Never Run", pdf)
+        self.assertEqual(len(report), pdf.count(b"/Subtype /Link"))
+        self.assertEqual(len(report), pdf.count(b"/Dest ["))
+
+    def test_unused_excludes_children_of_used_workflows(self):
+        report, _ = MODULE.build_report(
+            WorkflowClient(), 365, "unused", check_rbac=False
+        )
+        jobs = {
+            item["name"] for item in report if item["kind"] == "job_template"
+        }
+        workflows = {
+            item["name"]
+            for item in report
+            if item["kind"] == "workflow_job_template"
+        }
+        self.assertEqual({"Truly Unused"}, jobs)
+        self.assertEqual({"Dormant Workflow"}, workflows)
 
     def test_unused_includes_old_and_never_run_jobs(self):
         report, _ = MODULE.build_report(FakeClient(), 365, "unused")
@@ -367,7 +607,10 @@ class ExportTests(unittest.TestCase):
         )
 
     def test_empty_yaml_and_pdf(self):
-        self.assertEqual("summary: []\njob_templates: []\n", MODULE.render_yaml([]))
+        self.assertEqual(
+            "summary: []\njob_templates: []\nworkflow_job_templates: []\n",
+            MODULE.render_yaml([]),
+        )
         pdf = MODULE.render_pdf(
             [], 365, "2025-08-19T00:00:00Z", "unused", rbac_checked=True
         )

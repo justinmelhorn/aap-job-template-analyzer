@@ -30,15 +30,33 @@ class StandardLibraryPdf:
 
     def __init__(self) -> None:
         self.pages: list[list[str]] = []
+        self.page_links: list[list[tuple[float, float, float, float, str]]] = []
         self.current: list[str] = []
+        self.current_links: list[tuple[float, float, float, float, str]] = []
+        self.destinations: dict[str, tuple[int, float]] = {}
         self.y = PAGE_HEIGHT - MARGIN
         self.new_page()
 
     def new_page(self) -> None:
         if self.current:
             self.pages.append(self.current)
+            self.page_links.append(self.current_links)
         self.current = []
+        self.current_links = []
         self.y = PAGE_HEIGHT - MARGIN
+
+    def destination(self, name: str) -> None:
+        self.destinations[name] = (len(self.pages), self.y)
+
+    def link(
+        self,
+        x: float,
+        y: float,
+        width: float,
+        height: float,
+        destination: str,
+    ) -> None:
+        self.current_links.append((x, y, width, height, destination))
 
     def text(
         self,
@@ -78,10 +96,19 @@ class StandardLibraryPdf:
     def finish(self) -> bytes:
         if self.current:
             self.pages.append(self.current)
+            self.page_links.append(self.current_links)
             self.current = []
+            self.current_links = []
         page_count = len(self.pages)
-        objects: list[bytes] = [b""] * (5 + page_count * 2)
+        link_count = sum(len(links) for links in self.page_links)
+        objects: list[bytes] = [b""] * (5 + page_count * 2 + link_count)
         page_ids = [5 + index * 2 for index in range(page_count)]
+        next_object_id = 5 + page_count * 2
+        annotation_ids: list[list[int]] = []
+        for links in self.page_links:
+            ids = list(range(next_object_id, next_object_id + len(links)))
+            annotation_ids.append(ids)
+            next_object_id += len(links)
         objects[1] = b"<< /Type /Catalog /Pages 2 0 R >>"
         kids = " ".join(f"{page_id} 0 R" for page_id in page_ids)
         objects[2] = (
@@ -93,6 +120,13 @@ class StandardLibraryPdf:
         for index, commands in enumerate(self.pages):
             page_id = page_ids[index]
             content_id = page_id + 1
+            annotations = ""
+            if annotation_ids[index]:
+                references = " ".join(
+                    f"{annotation_id} 0 R"
+                    for annotation_id in annotation_ids[index]
+                )
+                annotations = f"/Annots [{references}] "
             footer = (
                 f"BT /F1 8.00 Tf 1 0 0 1 {PAGE_WIDTH / 2 - 22:.2f} 18.00 Tm "
                 f"(Page {index + 1} of {page_count}) Tj ET"
@@ -102,13 +136,28 @@ class StandardLibraryPdf:
                 "<< /Type /Page /Parent 2 0 R "
                 f"/MediaBox [0 0 {PAGE_WIDTH} {PAGE_HEIGHT}] "
                 "/Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> "
-                f"/Contents {content_id} 0 R >>"
+                f"{annotations}/Contents {content_id} 0 R >>"
             ).encode("ascii")
             objects[content_id] = (
                 f"<< /Length {len(stream)} >>\nstream\n".encode("ascii")
                 + stream
                 + b"endstream"
             )
+
+        for page_index, links in enumerate(self.page_links):
+            for annotation_id, (x, y, width, height, target) in zip(
+                annotation_ids[page_index], links
+            ):
+                if target not in self.destinations:
+                    raise ValueError(f"unknown PDF destination: {target}")
+                target_page, target_y = self.destinations[target]
+                objects[annotation_id] = (
+                    "<< /Type /Annot /Subtype /Link "
+                    f"/Rect [{x:.2f} {y:.2f} {x + width:.2f} {y + height:.2f}] "
+                    "/Border [0 0 0] "
+                    f"/Dest [{page_ids[target_page]} 0 R /XYZ null {target_y:.2f} null] "
+                    ">>"
+                ).encode("ascii")
 
         output = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
         offsets = [0]
@@ -167,6 +216,7 @@ def table(
     headers: list[str],
     rows: list[list[Any]],
     widths: list[float],
+    row_links: Optional[list[Optional[str]]] = None,
 ) -> None:
     row_number = 0
 
@@ -203,8 +253,16 @@ def table(
             draw_header()
         x = MARGIN
         fill = 0.97 if row_number % 2 else None
-        for lines, width in zip(wrapped, widths):
+        for column, (lines, width) in enumerate(zip(wrapped, widths)):
             document.rectangle(x, document.y - height, width, height, fill)
+            if column == 0 and row_links and row_links[row_number]:
+                document.link(
+                    x,
+                    document.y - height,
+                    width,
+                    height,
+                    row_links[row_number] or "",
+                )
             baseline = document.y - 14
             for line in lines:
                 document.text(x + 5, baseline, line, 8.5)
